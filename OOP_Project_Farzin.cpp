@@ -55,7 +55,7 @@ public:
             // Throw error or handle mismatch
         }
     }
-
+/
     // Constructor for CCVS/CCCS (Current Controlled)
     CircuitElement(ElementType t, std::string n, int n1, int n2, std::string ctrlName, double g)
             : type(t), name(std::move(n)), node1(n1), node2(n2), value(0.0), // value might not be used directly
