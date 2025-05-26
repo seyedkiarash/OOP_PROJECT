@@ -3,6 +3,7 @@
 #include <string>
 #include <set>
 #include <algorithm>
+#include <Eigen/Dense>
 
 // Enum to represent the type of circuit element
 enum class ElementType {
@@ -123,5 +124,185 @@ public:
             std::cout << node << " ";
         }
         std::cout << std::endl;
+    }
+};
+
+// --- MNASystem using Eigen ---
+class MNASystem {
+public:
+    Eigen::MatrixXd A; // MNA Matrix using Eigen
+    Eigen::VectorXd b; // RHS Vector using Eigen
+
+    int numNonGroundNodes;
+    int numIndVoltageSources;
+    const Circuit* circuit_ptr;
+
+    std::map<int, int> nodeToIndexMap; // Maps circuit node ID to 0-indexed matrix row/col
+    std::map<std::string, int> vSourceNameToCurrentIndexMap; // Maps V-source name to its current variable index
+
+    MNASystem(const Circuit& c) : circuit_ptr(&c) {
+        numNonGroundNodes = 0;
+        int currentIndex = 0;
+        for(int node_num : c.nodes) {
+            if (node_num != c.groundNode) {
+                nodeToIndexMap[node_num] = currentIndex++;
+            }
+        }
+        numNonGroundNodes = currentIndex;
+
+        numIndVoltageSources = 0;
+        for (const auto& elem : c.elements) {
+            if (elem.elementType && dynamic_cast<VoltageSourceIndependentElementType*>(elem.elementType.get())) {
+                // The index for current variables starts after all node voltage variables
+                vSourceNameToCurrentIndexMap[elem.name] = numNonGroundNodes + numIndVoltageSources;
+                numIndVoltageSources++;
+            }
+        }
+
+        int matrixSize = numNonGroundNodes + numIndVoltageSources;
+        if (matrixSize > 0) {
+            A = Eigen::MatrixXd::Zero(matrixSize, matrixSize);
+            b = Eigen::VectorXd::Zero(matrixSize);
+        } else {
+            // Handle empty circuit or circuit with only ground
+            std::cerr << "Warning: MNA system size is 0." << std::endl;
+        }
+    }
+
+    // Get matrix index for a node number
+    int getIndex(int node) {
+        if (node == circuit_ptr->groundNode) return -1; // Ground node doesn't have a direct row/col
+        auto it = nodeToIndexMap.find(node);
+        if (it != nodeToIndexMap.end()) {
+            return it->second;
+        }
+        std::cerr << "Error: Node " << node << " not found in map." << std::endl;
+        return -2; // Error indicator
+    }
+
+    void buildMatrices() {
+        if (!circuit_ptr || A.size() == 0) { // Ensure circuit_ptr is valid and matrix is initialized
+            if (A.size() == 0 && (numNonGroundNodes + numIndVoltageSources > 0)) {
+                std::cerr << "Error: MNA Matrix not properly initialized." << std::endl;
+            }
+            return;
+        }
+
+        for (const auto& elem : circuit_ptr->elements) {
+            if (!elem.elementType) continue;
+
+            int n1_idx = getIndex(elem.node1);
+            int n2_idx = getIndex(elem.node2);
+
+            if (dynamic_cast<ResistorElementType*>(elem.elementType.get())) {
+                if (elem.value == 0) {
+                    std::cerr << "Error: Resistor " << elem.name << " has zero resistance." << std::endl;
+                    continue; // Avoid division by zero
+                }
+                double conductance = 1.0 / elem.value;
+                if (n1_idx != -1) { // If node1 is not ground
+                    A(n1_idx, n1_idx) += conductance;
+                    if (n2_idx != -1) { // If node2 is also not ground
+                        A(n1_idx, n2_idx) -= conductance;
+                        A(n2_idx, n1_idx) -= conductance;
+                        A(n2_idx, n2_idx) += conductance;
+                    }
+                } else { // node1 is ground
+                    if (n2_idx != -1) { // node2 is not ground
+                        A(n2_idx, n2_idx) += conductance;
+                    }
+                }
+            } else if (dynamic_cast<CurrentSourceIndependentElementType*>(elem.elementType.get())) {
+                if (n1_idx != -1) { // Current entering n1 from source
+                    b(n1_idx) -= elem.value;
+                }
+                if (n2_idx != -1) { // Current leaving n2 into source
+                    b(n2_idx) += elem.value;
+                }
+            } else if (dynamic_cast<VoltageSourceIndependentElementType*>(elem.elementType.get())) {
+                auto it = vSourceNameToCurrentIndexMap.find(elem.name);
+                if (it == vSourceNameToCurrentIndexMap.end()) {
+                    std::cerr << "Error: Voltage source " << elem.name << " not mapped to a current index." << std::endl;
+                    continue;
+                }
+                int currentVarIdx = it->second; // This is the index for the V-source's current variable
+
+                // KCL contributions (B matrix part)
+                if (n1_idx != -1) { // Positive terminal
+                    A(n1_idx, currentVarIdx) += 1.0;
+                }
+                if (n2_idx != -1) { // Negative terminal
+                    A(n2_idx, currentVarIdx) -= 1.0;
+                }
+
+                // Branch equation for the voltage source (C matrix part and E vector part)
+                // V_n1 - V_n2 = Value  =>  1*V_n1 - 1*V_n2 = Value
+                // This is A(currentVarIdx, voltage_indices_involved) = coefficients
+                // and b(currentVarIdx) = source_value
+                if (n1_idx != -1) {
+                    A(currentVarIdx, n1_idx) += 1.0;
+                }
+                if (n2_idx != -1) {
+                    A(currentVarIdx, n2_idx) -= 1.0;
+                }
+                b(currentVarIdx) = elem.value; // E vector part
+            }
+            // TODO: Add stamps for other elements (Capacitors, Inductors for transient, Dependent Sources)
+        }
+    }
+
+    // --- Solvers using Eigen ---
+
+    // Solve Ax = b using Eigen's PartialPivLU decomposition (similar to Gaussian Elimination)
+    Eigen::VectorXd solveWithPartialPivLU() {
+        if (A.rows() == 0 || A.cols() == 0) {
+            std::cerr << "Error: Matrix A is empty or not initialized for LU solver." << std::endl;
+            return Eigen::VectorXd();
+        }
+        if (A.rows() != b.size()) {
+            std::cerr << "Error: Matrix A and vector b dimensions mismatch for LU solver." << std::endl;
+            return Eigen::VectorXd();
+        }
+        // Check if the matrix is square
+        if (A.rows() != A.cols()) {
+            std::cerr << "Error: Matrix A is not square, cannot use PartialPivLU directly. Consider QR decomposition for non-square systems." << std::endl;
+            return Eigen::VectorXd();
+        }
+
+        Eigen::PartialPivLU<Eigen::MatrixXd> lu(A);
+        if (lu.info() != Eigen::Success) {
+            std::cerr << "Error: LU decomposition failed. Matrix might be singular." << std::endl;
+            return Eigen::VectorXd();
+        }
+        Eigen::VectorXd x = lu.solve(b);
+        if (lu.info() != Eigen::Success) { // Check solve status
+            std::cerr << "Error: Solving Ax=b after LU decomposition failed." << std::endl;
+            return Eigen::VectorXd();
+        }
+        return x;
+    }
+
+    // Solve Ax = b using Eigen's QR decomposition (robust, can handle non-square matrices too)
+    Eigen::VectorXd solveWithQR() {
+        if (A.rows() == 0 || A.cols() == 0) {
+            std::cerr << "Error: Matrix A is empty or not initialized for QR solver." << std::endl;
+            return Eigen::VectorXd();
+        }
+        if (A.rows() != b.size()) {
+            std::cerr << "Error: Matrix A and vector b dimensions mismatch for QR solver." << std::endl;
+            return Eigen::VectorXd();
+        }
+        // ColPivHouseholderQR is robust for rank-deficient matrices as well
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(A);
+        if (qr.info() != Eigen::Success) {
+            std::cerr << "Error: QR decomposition failed." << std::endl;
+            return Eigen::VectorXd();
+        }
+        Eigen::VectorXd x = qr.solve(b);
+        if (qr.info() != Eigen::Success) { // Check solve status
+            std::cerr << "Error: Solving Ax=b after QR decomposition failed." << std::endl;
+            return Eigen::VectorXd();
+        }
+        return x;
     }
 };
