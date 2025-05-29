@@ -1,308 +1,452 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <set>
-#include <algorithm>
-#include <Eigen/Dense>
+#include <stdexcept> // For std::invalid_argument and std::runtime_error
+#include <map>       // For node and voltage source to index mapping
+#include <iomanip>   // For output formatting (std::fixed, std::setprecision)
+#include "Eigen/Dense" // Core Eigen library for dense matrices and vectors
 
-// Enum to represent the type of circuit element
-enum class ElementType {
-    RESISTOR,
-    CAPACITOR,
-    INDUCTOR,
-    VOLTAGE_SOURCE_INDEPENDENT,
-    CURRENT_SOURCE_INDEPENDENT,
-    VOLTAGE_SOURCE_DEPENDENT_VCVS,
-    CURRENT_SOURCE_DEPENDENT_CCCS,
-    VOLTAGE_SOURCE_DEPENDENT_CCVS,
-    CURRENT_SOURCE_DEPENDENT_VCCS,
-    DIODE, //
-    GROUND //
-    // Add other types as needed
-};
+// Using namespace std for simplicity in this example
+// In larger projects, it's better to use std:: prefix or more limited using declarations.
+using namespace std;
 
-// Structure to store information for each circuit element
-class CircuitElement {
+// Node class definition
+class Node {
+private:
+    double voltage;
+    string name;
+
 public:
-    ElementType type;
-    std::string name; // Unique identifier for the element
-    int node1;        // First connected node
-    int node2;        // Second connected node
-    double value;     // Value of the element (e.g., resistance, voltage)
-
-    // For dependent sources
-    int controlNode1; // For VCVS, VCCS
-    int controlNode2; // For VCVS, VCCS
-    std::string controllingElementName; // For CCVS, CCCS (name of the V-source whose current is controlling)
-    double gain;       // Gain for dependent sources
-
-    // Default constructor
-    CircuitElement() : type(ElementType::RESISTOR), node1(0), node2(0), value(0.0),
-                       controlNode1(0), controlNode2(0), gain(0.0) {}
-
-    // Constructor for basic elements
-    CircuitElement(ElementType t, std::string n, int n1, int n2, double val)
-            : type(t), name(std::move(n)), node1(n1), node2(n2), value(val),
-              controlNode1(0), controlNode2(0), gain(0.0) {
-        // Assuming node 0 is ground, as suggested
+    Node(const string &name, double voltage = 0.0) {
+        this->name = name;
+        this->voltage = voltage;
     }
 
-    // Constructor for VCVS/VCCS (Voltage Controlled)
-    CircuitElement(ElementType t, std::string n, int n1, int n2, int cn1, int cn2, double g)
-            : type(t), name(std::move(n)), node1(n1), node2(n2), value(0.0), // value might not be used directly
-              controlNode1(cn1), controlNode2(cn2), controllingElementName(""), gain(g) {
-        if (t != ElementType::VOLTAGE_SOURCE_DEPENDENT_VCVS && t != ElementType::CURRENT_SOURCE_DEPENDENT_VCCS) {
-            // Throw error or handle mismatch
-        }
-    }
-/
-    // Constructor for CCVS/CCCS (Current Controlled)
-    CircuitElement(ElementType t, std::string n, int n1, int n2, std::string ctrlName, double g)
-            : type(t), name(std::move(n)), node1(n1), node2(n2), value(0.0), // value might not be used directly
-              controlNode1(0), controlNode2(0), controllingElementName(std::move(ctrlName)), gain(g) {
-        if (t != ElementType::VOLTAGE_SOURCE_DEPENDENT_CCVS && t != ElementType::CURRENT_SOURCE_DEPENDENT_CCCS) {
-            // Throw error or handle mismatch
-        }
+    string getName() const {
+        return name;
     }
 
+    double getVoltage() const {
+        return voltage;
+    }
 
-    void print() const {
-        std::cout << "Element: " << name << ", Type: " << static_cast<int>(type)
-                  << ", Node1: " << node1 << ", Node2: " << node2
-                  << ", Value: " << value;
-        if (type == ElementType::VOLTAGE_SOURCE_DEPENDENT_VCVS || type == ElementType::CURRENT_SOURCE_DEPENDENT_VCCS) {
-            std::cout << ", CtrlNode1: " << controlNode1 << ", CtrlNode2: " << controlNode2 << ", Gain: " << gain;
-        } else if (type == ElementType::VOLTAGE_SOURCE_DEPENDENT_CCVS || type == ElementType::CURRENT_SOURCE_DEPENDENT_CCCS) {
-            std::cout << ", ControllingElement: " << controllingElementName << ", Gain: " << gain;
-        }
-        std::cout << std::endl;
+    void setVoltage(double v) {
+        voltage = v;
+    }
+
+    bool isGround() const {
+        return name == "0" || name == "GND" || name == "gnd";
     }
 };
 
-// Class to represent the entire circuit
-class Circuit {
+// Element base class definition
+class Element {
+protected:
+    Node *node1, *node2;
+    string name;
+
 public:
-    std::vector<CircuitElement> elements;
-    std::set<int> nodes; // Stores unique node numbers, 0 is typically ground
-    int groundNode = 0; // Explicitly define ground node
-
-    void addElement(const CircuitElement& elem) {
-        elements.push_back(elem);
-        if (elem.node1 != groundNode) nodes.insert(elem.node1); // Add nodes, excluding ground if managed separately
-        if (elem.node2 != groundNode) nodes.insert(elem.node2);
-        // For dependent sources, control nodes also need to be considered if they are part of the circuit's nodes
-        if (elem.type == ElementType::VOLTAGE_SOURCE_DEPENDENT_VCVS || elem.type == ElementType::CURRENT_SOURCE_DEPENDENT_VCCS) {
-            if (elem.controlNode1 != groundNode) nodes.insert(elem.controlNode1);
-            if (elem.controlNode2 != groundNode) nodes.insert(elem.controlNode2);
+    Element(Node* n1, Node* n2, const string &name) {
+        if (!n1 || !n2) {
+            throw std::invalid_argument("Element nodes cannot be null.");
         }
+        this->node1 = n1;
+        this->node2 = n2;
+        this->name = name;
     }
 
-    // Example function to get the number of non-ground nodes
-    int getNumNonGroundNodes() const {
-        return nodes.size();
+    virtual ~Element() = default;
+
+    string getName() const { return name; }
+    Node* getNode1() const { return node1; }
+    Node* getNode2() const { return node2; }
+
+    virtual string getType() const = 0;
+    virtual double getValue() const = 0;
+    virtual double getCurrent() const {
+        return 0.0; // Default implementation
     }
-
-    // Example function to get number of independent voltage sources
-    int getNumIndependentVoltageSources() const {
-        int count = 0;
-        for (const auto& elem : elements) {
-            if (elem.type == ElementType::VOLTAGE_SOURCE_INDEPENDENT) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-
-    void printCircuit() const {
-        std::cout << "Circuit Elements:" << std::endl;
-        for (const auto& elem : elements) {
-            elem.print();
-        }
-        std::cout << "Circuit Nodes (excluding ground " << groundNode << "): ";
-        for (int node : nodes) {
-            std::cout << node << " ";
-        }
-        std::cout << std::endl;
+    virtual void setCurrent(double current) {
+        (void)current; // Default implementation to avoid unused parameter warning
     }
 };
 
-// --- MNASystem using Eigen ---
-class MNASystem {
+// Resistor class
+class Resistor : public Element {
+private:
+    double resistance;
+
 public:
-    Eigen::MatrixXd A; // MNA Matrix using Eigen
-    Eigen::VectorXd b; // RHS Vector using Eigen
+    Resistor(Node* n1, Node* n2, const string &name, double res) : Element(n1, n2, name) {
+        if (res <= 0) {
+            throw std::invalid_argument("Error: Resistance value must be positive. Resistor: " + name);
+        }
+        this->resistance = res;
+    }
 
-    int numNonGroundNodes;
-    int numIndVoltageSources;
-    const Circuit* circuit_ptr;
+    string getType() const override { return "Resistor"; }
+    double getValue() const override { return resistance; }
 
-    std::map<int, int> nodeToIndexMap; // Maps circuit node ID to 0-indexed matrix row/col
-    std::map<std::string, int> vSourceNameToCurrentIndexMap; // Maps V-source name to its current variable index
+    double getCurrent() const override {
+        if (node1 && node2) {
+            return (node1->getVoltage() - node2->getVoltage()) / resistance;
+        }
+        return 0.0;
+    }
+};
 
-    MNASystem(const Circuit& c) : circuit_ptr(&c) {
-        numNonGroundNodes = 0;
-        int currentIndex = 0;
-        for(int node_num : c.nodes) {
-            if (node_num != c.groundNode) {
-                nodeToIndexMap[node_num] = currentIndex++;
+// VoltageSource class
+class VoltageSource : public Element {
+private:
+    double voltageValue;
+    double currentThroughSource;
+
+public:
+    VoltageSource(Node* n1, Node* n2, const string &name, double val) : Element(n1, n2, name) {
+        this->voltageValue = val;
+        this->currentThroughSource = 0.0; // Initial value
+    }
+
+    string getType() const override { return "VoltageSource"; }
+    double getValue() const override { return voltageValue; }
+
+    double getCurrent() const override {
+        return currentThroughSource;
+    }
+    void setCurrent(double current) override {
+        this->currentThroughSource = current;
+    }
+};
+
+// CurrentSource class
+class CurrentSource : public Element {
+private:
+    double currentValue;
+
+public:
+    CurrentSource(Node* n1, Node* n2, const string &name, double val) : Element(n1, n2, name) {
+        this->currentValue = val;
+    }
+
+    string getType() const override { return "CurrentSource"; }
+    double getValue() const override { return currentValue; }
+};
+
+// MakingMNA class
+class MakingMNA {
+private:
+    vector<Node*> allNodesInCircuit;
+    vector<Element*> elementsInCircuit;
+    Node* groundNodeRef;
+
+    map<Node*, int> nodeToIndexMap;
+    vector<Node*> orderedNonGroundNodes;
+    map<VoltageSource*, int> vsToIndexMap;
+    vector<VoltageSource*> orderedVoltageSources;
+
+    void buildNodeAndVoltageSourceMaps() {
+        nodeToIndexMap.clear();
+        orderedNonGroundNodes.clear();
+        vsToIndexMap.clear();
+        orderedVoltageSources.clear();
+
+        if (!groundNodeRef) {
+            for (Node* n : allNodesInCircuit) {
+                if (n->isGround()) {
+                    groundNodeRef = n;
+                    break;
+                }
+            }
+            if (!groundNodeRef) {
+                throw std::runtime_error("Error: Ground node not detected in the circuit. Analysis is not possible.");
             }
         }
-        numNonGroundNodes = currentIndex;
 
-        numIndVoltageSources = 0;
-        for (const auto& elem : c.elements) {
-            if (elem.elementType && dynamic_cast<VoltageSourceIndependentElementType*>(elem.elementType.get())) {
-                // The index for current variables starts after all node voltage variables
-                vSourceNameToCurrentIndexMap[elem.name] = numNonGroundNodes + numIndVoltageSources;
-                numIndVoltageSources++;
+        int nodeIdx = 0;
+        for (Node* node : allNodesInCircuit) {
+            if (node != groundNodeRef) {
+                orderedNonGroundNodes.push_back(node);
+                nodeToIndexMap[node] = nodeIdx++;
             }
         }
 
-        int matrixSize = numNonGroundNodes + numIndVoltageSources;
-        if (matrixSize > 0) {
-            A = Eigen::MatrixXd::Zero(matrixSize, matrixSize);
-            b = Eigen::VectorXd::Zero(matrixSize);
-        } else {
-            // Handle empty circuit or circuit with only ground
-            std::cerr << "Warning: MNA system size is 0." << std::endl;
+        int vsIdx = 0;
+        for (Element* elem : elementsInCircuit) {
+            if (auto vs = dynamic_cast<VoltageSource*>(elem)) {
+                orderedVoltageSources.push_back(vs);
+                vsToIndexMap[vs] = vsIdx++;
+            }
         }
     }
 
-    // Get matrix index for a node number
-    int getIndex(int node) {
-        if (node == circuit_ptr->groundNode) return -1; // Ground node doesn't have a direct row/col
-        auto it = nodeToIndexMap.find(node);
-        if (it != nodeToIndexMap.end()) {
-            return it->second;
-        }
-        std::cerr << "Error: Node " << node << " not found in map." << std::endl;
-        return -2; // Error indicator
+public:
+    MakingMNA() : groundNodeRef(nullptr) {}
+
+    ~MakingMNA() {
+        // Assuming memory management of nodes and elements is handled outside this class
     }
 
-    void buildMatrices() {
-        if (!circuit_ptr || A.size() == 0) { // Ensure circuit_ptr is valid and matrix is initialized
-            if (A.size() == 0 && (numNonGroundNodes + numIndVoltageSources > 0)) {
-                std::cerr << "Error: MNA Matrix not properly initialized." << std::endl;
+    void addNode(Node* node) {
+        if (!node) return;
+        allNodesInCircuit.push_back(node);
+        if (node->isGround()) {
+            if (groundNodeRef != nullptr && groundNodeRef != node) {
+                cout << "Warning: Multiple ground nodes defined. Using the first identified ground node: "
+                     << groundNodeRef->getName() << endl;
+            } else if (groundNodeRef == nullptr) {
+                groundNodeRef = node;
             }
-            return;
-        }
-
-        for (const auto& elem : circuit_ptr->elements) {
-            if (!elem.elementType) continue;
-
-            int n1_idx = getIndex(elem.node1);
-            int n2_idx = getIndex(elem.node2);
-
-            if (dynamic_cast<ResistorElementType*>(elem.elementType.get())) {
-                if (elem.value == 0) {
-                    std::cerr << "Error: Resistor " << elem.name << " has zero resistance." << std::endl;
-                    continue; // Avoid division by zero
-                }
-                double conductance = 1.0 / elem.value;
-                if (n1_idx != -1) { // If node1 is not ground
-                    A(n1_idx, n1_idx) += conductance;
-                    if (n2_idx != -1) { // If node2 is also not ground
-                        A(n1_idx, n2_idx) -= conductance;
-                        A(n2_idx, n1_idx) -= conductance;
-                        A(n2_idx, n2_idx) += conductance;
-                    }
-                } else { // node1 is ground
-                    if (n2_idx != -1) { // node2 is not ground
-                        A(n2_idx, n2_idx) += conductance;
-                    }
-                }
-            } else if (dynamic_cast<CurrentSourceIndependentElementType*>(elem.elementType.get())) {
-                if (n1_idx != -1) { // Current entering n1 from source
-                    b(n1_idx) -= elem.value;
-                }
-                if (n2_idx != -1) { // Current leaving n2 into source
-                    b(n2_idx) += elem.value;
-                }
-            } else if (dynamic_cast<VoltageSourceIndependentElementType*>(elem.elementType.get())) {
-                auto it = vSourceNameToCurrentIndexMap.find(elem.name);
-                if (it == vSourceNameToCurrentIndexMap.end()) {
-                    std::cerr << "Error: Voltage source " << elem.name << " not mapped to a current index." << std::endl;
-                    continue;
-                }
-                int currentVarIdx = it->second; // This is the index for the V-source's current variable
-
-                // KCL contributions (B matrix part)
-                if (n1_idx != -1) { // Positive terminal
-                    A(n1_idx, currentVarIdx) += 1.0;
-                }
-                if (n2_idx != -1) { // Negative terminal
-                    A(n2_idx, currentVarIdx) -= 1.0;
-                }
-
-                // Branch equation for the voltage source (C matrix part and E vector part)
-                // V_n1 - V_n2 = Value  =>  1*V_n1 - 1*V_n2 = Value
-                // This is A(currentVarIdx, voltage_indices_involved) = coefficients
-                // and b(currentVarIdx) = source_value
-                if (n1_idx != -1) {
-                    A(currentVarIdx, n1_idx) += 1.0;
-                }
-                if (n2_idx != -1) {
-                    A(currentVarIdx, n2_idx) -= 1.0;
-                }
-                b(currentVarIdx) = elem.value; // E vector part
-            }
-            // TODO: Add stamps for other elements (Capacitors, Inductors for transient, Dependent Sources)
         }
     }
 
-    // --- Solvers using Eigen ---
+    void addElement(Element* element) {
+        if (!element) return;
+        elementsInCircuit.push_back(element);
+    }
 
-    // Solve Ax = b using Eigen's PartialPivLU decomposition (similar to Gaussian Elimination)
-    Eigen::VectorXd solveWithPartialPivLU() {
-        if (A.rows() == 0 || A.cols() == 0) {
-            std::cerr << "Error: Matrix A is empty or not initialized for LU solver." << std::endl;
-            return Eigen::VectorXd();
+    void setGroundNode(Node* gnd) {
+        if (!gnd) {
+            throw std::invalid_argument("Ground node cannot be null.");
         }
-        if (A.rows() != b.size()) {
-            std::cerr << "Error: Matrix A and vector b dimensions mismatch for LU solver." << std::endl;
-            return Eigen::VectorXd();
+        bool found = false;
+        for(Node* n : allNodesInCircuit) {
+            if(n == gnd) {
+                found = true;
+                break;
+            }
         }
-        // Check if the matrix is square
-        if (A.rows() != A.cols()) {
-            std::cerr << "Error: Matrix A is not square, cannot use PartialPivLU directly. Consider QR decomposition for non-square systems." << std::endl;
-            return Eigen::VectorXd();
+        if(!found) addNode(gnd); // Add ground node if not already in the list
+
+        groundNodeRef = gnd;
+    }
+
+    Eigen::MatrixXd getSystemMatrixA() {
+        buildNodeAndVoltageSourceMaps();
+
+        int numNonGroundNodes = orderedNonGroundNodes.size();
+        int numVoltageSources = orderedVoltageSources.size();
+        int systemSize = numNonGroundNodes + numVoltageSources;
+
+        if (systemSize == 0) {
+            throw std::runtime_error("Error: Circuit is too small for analysis (no non-ground nodes or voltage sources).");
         }
 
+        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(systemSize, systemSize);
+
+        // G part (conductances from resistors)
+        for (Element* elem : elementsInCircuit) {
+            if (auto res = dynamic_cast<Resistor*>(elem)) {
+                double conductance = 1.0 / res->getValue();
+                Node* n1 = res->getNode1();
+                Node* n2 = res->getNode2();
+
+                if (n1 != groundNodeRef) {
+                    A(nodeToIndexMap[n1], nodeToIndexMap[n1]) += conductance;
+                }
+                if (n2 != groundNodeRef) {
+                    A(nodeToIndexMap[n2], nodeToIndexMap[n2]) += conductance;
+                }
+                if (n1 != groundNodeRef && n2 != groundNodeRef) {
+                    A(nodeToIndexMap[n1], nodeToIndexMap[n2]) -= conductance;
+                    A(nodeToIndexMap[n2], nodeToIndexMap[n1]) -= conductance;
+                }
+            }
+        }
+
+        // B and C parts (voltage sources)
+        for (size_t i = 0; i < orderedVoltageSources.size(); ++i) {
+            VoltageSource* vs = orderedVoltageSources[i];
+            Node* n_plus = vs->getNode1();
+            Node* n_minus = vs->getNode2();
+            int vsMNAIndex = vsToIndexMap[vs]; // Index for this voltage source's current unknown
+
+            if (n_plus != groundNodeRef) {
+                int nodeIdx = nodeToIndexMap[n_plus];
+                A(nodeIdx, numNonGroundNodes + vsMNAIndex) += 1.0;  // B part
+                A(numNonGroundNodes + vsMNAIndex, nodeIdx) += 1.0;  // C part
+            }
+            if (n_minus != groundNodeRef) {
+                int nodeIdx = nodeToIndexMap[n_minus];
+                A(nodeIdx, numNonGroundNodes + vsMNAIndex) -= 1.0; // B part
+                A(numNonGroundNodes + vsMNAIndex, nodeIdx) -= 1.0; // C part
+            }
+        }
+        // D part is zero for ideal independent voltage sources, already initialized by Zero()
+
+        return A;
+    }
+
+    Eigen::VectorXd getSystemVectorZ() {
+        // Assumes buildNodeAndVoltageSourceMaps() has been called
+        int numNonGroundNodes = orderedNonGroundNodes.size();
+        int numVoltageSources = orderedVoltageSources.size();
+        int systemSize = numNonGroundNodes + numVoltageSources;
+
+        if (systemSize == 0 && numNonGroundNodes == 0) {
+            Eigen::VectorXd Z_empty(0);
+            return Z_empty;
+        }
+
+        Eigen::VectorXd Z = Eigen::VectorXd::Zero(systemSize);
+
+        // J part (current sources)
+        for (Element* elem : elementsInCircuit) {
+            if (auto cs = dynamic_cast<CurrentSource*>(elem)) {
+                Node* n_from = cs->getNode1(); // Current leaves this node
+                Node* n_to = cs->getNode2();   // Current enters this node
+                double currentValue = cs->getValue();
+
+                if (n_to != groundNodeRef) {
+                    Z(nodeToIndexMap[n_to]) += currentValue;
+                }
+                if (n_from != groundNodeRef) {
+                    Z(nodeToIndexMap[n_from]) -= currentValue;
+                }
+            }
+        }
+
+        // E part (voltage source values)
+        for (size_t i = 0; i < orderedVoltageSources.size(); ++i) {
+            VoltageSource* vs = orderedVoltageSources[i];
+            int vsMNAIndex = vsToIndexMap[vs];
+            Z(numNonGroundNodes + vsMNAIndex) = vs->getValue();
+        }
+        return Z;
+    }
+
+    const vector<Node*>& getOrderedNonGroundNodes() const {
+        return orderedNonGroundNodes;
+    }
+
+    const vector<VoltageSource*>& getOrderedVoltageSources() const {
+        return orderedVoltageSources;
+    }
+    const map<VoltageSource*, int>& getVoltageSourceToIndexMap() const {
+        return vsToIndexMap;
+    }
+    const vector<Element*>& getAllElements() const {
+        return elementsInCircuit;
+    }
+};
+
+// MNASolver class
+class MNASolver {
+public:
+    MNASolver() {}
+
+    Eigen::VectorXd solve(const Eigen::MatrixXd& A, const Eigen::VectorXd& Z) {
+        if (A.rows() != A.cols() || A.rows() != Z.size()) {
+            throw std::runtime_error("Error: Matrix and vector dimensions are not compatible for solving.");
+        }
+        if (A.rows() == 0) {
+            throw std::runtime_error("Error: System of equations is empty.");
+        }
+
+        // Using LU decomposition with partial pivoting for numerical stability
         Eigen::PartialPivLU<Eigen::MatrixXd> lu(A);
-        if (lu.info() != Eigen::Success) {
-            std::cerr << "Error: LU decomposition failed. Matrix might be singular." << std::endl;
-            return Eigen::VectorXd();
+        // Check for singularity using the determinant.
+        if (std::abs(lu.determinant()) < 1e-9) { // MODIFIED LINE
+            throw std::runtime_error("Error: System matrix is singular or ill-conditioned (determinant is near zero). The circuit may not be solvable (e.g., floating sections, redundant voltage sources).");
         }
-        Eigen::VectorXd x = lu.solve(b);
-        if (lu.info() != Eigen::Success) { // Check solve status
-            std::cerr << "Error: Solving Ax=b after LU decomposition failed." << std::endl;
-            return Eigen::VectorXd();
-        }
-        return x;
+        // test for invertibility in this context.
+
+        return lu.solve(Z);
     }
 
-    // Solve Ax = b using Eigen's QR decomposition (robust, can handle non-square matrices too)
-    Eigen::VectorXd solveWithQR() {
-        if (A.rows() == 0 || A.cols() == 0) {
-            std::cerr << "Error: Matrix A is empty or not initialized for QR solver." << std::endl;
-            return Eigen::VectorXd();
+    void updateCircuitState(const Eigen::VectorXd& X, MakingMNA& mnaCircuit) {
+        const auto& nonGroundNodes = mnaCircuit.getOrderedNonGroundNodes();
+        const auto& voltageSources = mnaCircuit.getOrderedVoltageSources();
+        const auto& vsMap = mnaCircuit.getVoltageSourceToIndexMap();
+
+        int numNonGroundNodes = nonGroundNodes.size();
+
+        if (X.size() != numNonGroundNodes + voltageSources.size()) {
+            throw std::runtime_error("Error: Solution vector size does not match the number of unknowns.");
         }
-        if (A.rows() != b.size()) {
-            std::cerr << "Error: Matrix A and vector b dimensions mismatch for QR solver." << std::endl;
-            return Eigen::VectorXd();
+
+        // Update node voltages
+        for (int i = 0; i < numNonGroundNodes; ++i) {
+            nonGroundNodes[i]->setVoltage(X(i));
         }
-        // ColPivHouseholderQR is robust for rank-deficient matrices as well
-        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(A);
-        if (qr.info() != Eigen::Success) {
-            std::cerr << "Error: QR decomposition failed." << std::endl;
-            return Eigen::VectorXd();
+
+        // Update currents through voltage sources
+        for (size_t i = 0; i < voltageSources.size(); ++i) {
+            VoltageSource* vs = voltageSources[i];
+            // Ensure vs is in vsMap before accessing.
+            // buildNodeAndVoltageSourceMaps in getSystemMatrixA should ensure this.
+            int vsMNAIndex = vsMap.at(vs); // This is the 0-based index relative to the start of VS unknowns
+            vs->setCurrent(X(numNonGroundNodes + vsMNAIndex));
         }
-        Eigen::VectorXd x = qr.solve(b);
-        if (qr.info() != Eigen::Success) { // Check solve status
-            std::cerr << "Error: Solving Ax=b after QR decomposition failed." << std::endl;
-            return Eigen::VectorXd();
-        }
-        return x;
     }
 };
+
+// Main function for testing
+int main() {
+    // Set output precision for floating-point numbers
+    cout << fixed << setprecision(6);
+
+    // 1. Create nodes
+    Node n1("1"), n2("2"), n_gnd("0"); // "0" or "GND" is typically ground
+
+    // 2. Create circuit manager and add nodes
+    MakingMNA circuit;
+    circuit.addNode(&n1);
+    circuit.addNode(&n2);
+    circuit.addNode(&n_gnd);
+    // circuit.setGroundNode(&n_gnd); // Explicitly set ground (though it's also auto-detected)
+
+    // 3. Create elements and add them to the circuit
+    try {
+        // Example from PDF section 9 (RC circuit): V1=5V, R=1k, C=1uF (here C is replaced with a second resistor for a DC example)
+        // V1 between node 1 and ground, R1 between 1 and 2, R2 between 2 and ground
+        VoltageSource vs(&n1, &n_gnd, "V1", 5.0);   // 5V voltage source between node 1 and ground
+        Resistor r1(&n1, &n2, "R1", 1000.0);     // 1 kOhm resistor between node 1 and 2
+        Resistor r2(&n2, &n_gnd, "R2", 2000.0);   // 2 kOhm resistor between node 2 and ground
+        // CurrentSource cs(&n_gnd, &n2, "I1", 0.001); // Example: 1mA current source from ground to node 2
+
+        circuit.addElement(&vs);
+        circuit.addElement(&r1);
+        circuit.addElement(&r2);
+        // circuit.addElement(&cs);
+
+        // 4. Get MNA matrices
+        Eigen::MatrixXd A = circuit.getSystemMatrixA();
+        Eigen::VectorXd Z = circuit.getSystemVectorZ();
+
+        cout << "System Matrix A:\n" << A << endl << endl;
+        cout << "System Vector Z:\n" << Z << endl << endl;
+
+        // 5. Solve the system
+        MNASolver solver;
+        Eigen::VectorXd X = solver.solve(A, Z);
+
+        cout << "Solution Vector X (node voltages then voltage source currents):\n" << X << endl << endl;
+
+        // 6. Update node voltages and voltage source currents in their respective objects
+        solver.updateCircuitState(X, circuit);
+
+        // 7. Print results
+        cout << "Node Voltages after solving:" << endl;
+        for (const auto* node : circuit.getOrderedNonGroundNodes()) {
+            cout << "Node " << node->getName() << ": " << node->getVoltage() << " V" << endl;
+        }
+
+        cout << "\nCurrents through Voltage Sources:" << endl;
+        for (const auto* vs_elem : circuit.getOrderedVoltageSources()) {
+            cout << "Current through " << vs_elem->getName() << ": " << vs_elem->getCurrent() << " A" << endl;
+        }
+
+        cout << "\nCurrents through Resistors (calculated after solving):" << endl;
+        for (const auto* elem : circuit.getAllElements()) {
+            if (const Resistor* res = dynamic_cast<const Resistor*>(elem)) {
+                cout << "Current through " << res->getName() << " (" << res->getNode1()->getName() << "->" << res->getNode2()->getName() << "): "
+                     << res->getCurrent() << " A" << endl;
+            }
+        }
+
+    } catch (const std::exception& e) {
+        cerr << "An error occurred: " << e.what() << endl;
+    }
+
+    return 0;
+}
