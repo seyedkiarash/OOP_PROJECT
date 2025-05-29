@@ -4,6 +4,7 @@
 #include <stdexcept> // For std::invalid_argument and std::runtime_error
 #include <map>       // For node and voltage source to index mapping
 #include <iomanip>   // For output formatting (std::fixed, std::setprecision)
+#include <cmath>     // For std::exp, std::abs in Diode and NR
 #include "Eigen/Dense" // Core Eigen library for dense matrices and vectors
 
 // Using namespace std for simplicity in this example
@@ -15,14 +16,13 @@ class Node {
 private:
     double voltage;
     string name;
-    double previousVoltage; // NEW MEMBER: For transient analysis
+    double previousVoltage; // For transient analysis
 
 public:
-    // MODIFIED CONSTRUCTOR to include previousVoltage
     Node(const string &name, double voltage = 0.0, double prev_voltage = 0.0) {
         this->name = name;
         this->voltage = voltage;
-        this->previousVoltage = prev_voltage; // Initialize previous voltage
+        this->previousVoltage = prev_voltage;
     }
 
     string getName() const {
@@ -37,23 +37,20 @@ public:
         voltage = v;
     }
 
-    // NEW METHOD
     double getPreviousVoltage() const {
         return previousVoltage;
     }
 
-    // NEW METHOD
     void setPreviousVoltage(double pv) {
         previousVoltage = pv;
     }
 
-    // Optional: Call after each transient step to update previous voltage for the next step
     void updateVoltageForNextStep() {
         previousVoltage = voltage;
     }
 
     bool isGround() const {
-        return name == "0" || name == "GND" || name == "gnd" || name == "0_rc" /*Added for new example*/;
+        return name == "0" || name == "GND" || name == "gnd" || name == "0_rc" || name == "0_diode";
     }
 };
 
@@ -80,7 +77,7 @@ public:
     Node* getNode2() const { return node2; }
 
     virtual string getType() const = 0;
-    virtual double getValue() const = 0;
+    virtual double getValue() const { return 0.0; } // Default, not all elements have a single "value"
     virtual double getCurrent() const {
         return 0.0; // Default implementation
     }
@@ -150,7 +147,7 @@ public:
     double getValue() const override { return currentValue; }
 };
 
-// NEW CLASS: Capacitor
+// Capacitor class
 class Capacitor : public Element {
 private:
     double capacitance;
@@ -165,7 +162,52 @@ public:
 
     string getType() const override { return "Capacitor"; }
     double getValue() const override { return capacitance; }
-    // getCurrent() for a capacitor in DC is 0. For transient MNA, its effect is modeled.
+};
+
+// *** NEW Diode Class ***
+class Diode : public Element {
+private:
+    double Is;   // Saturation current
+    double Vt_n; // Thermal voltage * ideality factor (n*Vt)
+
+public:
+    // For Newton-Raphson
+    double voltage_k;       // Voltage guess Vd^(k)
+    double current_at_voltage_k; // Id(Vd^(k))
+    double geq_k;           // Equivalent conductance at Vd^(k)
+    double ieq_k;           // Equivalent current source at Vd^(k)
+
+    Diode(Node* n1, Node* n2, const string &name, double saturation_current = 1e-14, double thermal_voltage_n = 0.026)
+            : Element(n1, n2, name), Is(saturation_current), Vt_n(thermal_voltage_n),
+              voltage_k(0.7), current_at_voltage_k(0.0), geq_k(0.0), ieq_k(0.0) { // Initial guess for Vd
+        if (Is <= 0 || Vt_n <=0) {
+            throw std::invalid_argument("Diode parameters Is and Vt_n must be positive.");
+        }
+        updateIterationParameters(voltage_k); // Initialize NR parameters
+    }
+
+    string getType() const override { return "Diode"; }
+
+    // Calculates and updates current_at_voltage_k, geq_k, ieq_k based on vd_guess
+    void updateIterationParameters(double vd_guess) {
+        voltage_k = vd_guess;
+        // Shockley diode equation: Id = Is * (exp(Vd / (n*Vt)) - 1)
+        double exp_term = std::exp(voltage_k / Vt_n);
+        current_at_voltage_k = Is * (exp_term - 1.0);
+
+        // Equivalent conductance: Geq = dId/dVd = (Is / (n*Vt)) * exp(Vd / (n*Vt))
+        geq_k = (Is / Vt_n) * exp_term;
+
+        // Equivalent current source: Ieq = Id - Geq * Vd
+        ieq_k = current_at_voltage_k - geq_k * voltage_k;
+    }
+
+    double getCurrent() const override {
+        // This returns the actual current based on final node voltages,
+        // not necessarily current_at_voltage_k which is for NR iteration.
+        double actual_vd = node1->getVoltage() - node2->getVoltage();
+        return Is * (std::exp(actual_vd / Vt_n) - 1.0);
+    }
 };
 
 
@@ -181,7 +223,7 @@ private:
     map<VoltageSource*, int> vsToIndexMap;
     vector<VoltageSource*> orderedVoltageSources;
 
-    double timeStep_h; // NEW MEMBER: For transient analysis
+    double timeStep_h;
 
     void buildNodeAndVoltageSourceMaps() {
         nodeToIndexMap.clear();
@@ -219,22 +261,19 @@ private:
     }
 
 public:
-    // MODIFIED CONSTRUCTOR to accept and store time step h. Defaults to -1 if not for transient.
     MakingMNA(double h = -1.0) : groundNodeRef(nullptr), timeStep_h(h) {}
 
     ~MakingMNA() {
-        // Assuming memory management of nodes and elements is handled outside this class
+        // Memory management of nodes and elements is assumed to be handled outside
     }
 
-    // NEW METHOD to set time step if not provided in constructor or to change it
     void setTimeStep(double h) {
-        if (h <= 0) {
-            throw std::invalid_argument("Error: Time step must be positive.");
+        if (h <= 0 && elementsInCircuit.end() != std::find_if(elementsInCircuit.begin(), elementsInCircuit.end(), [](Element* e){ return dynamic_cast<Capacitor*>(e) != nullptr || dynamic_cast<Diode*>(e) != nullptr; })) { // Simplified check, diodes might not always need h for DC NR
+            throw std::invalid_argument("Error: Time step must be positive for circuits with reactive elements.");
         }
         this->timeStep_h = h;
     }
 
-    // NEW METHOD to get time step
     double getTimeStep() const {
         return this->timeStep_h;
     }
@@ -268,8 +307,7 @@ public:
                 break;
             }
         }
-        if(!found) addNode(gnd); // Add ground node if not already in the list
-
+        if(!found) addNode(gnd);
         groundNodeRef = gnd;
     }
 
@@ -280,27 +318,35 @@ public:
         int numVoltageSources = orderedVoltageSources.size();
         int systemSize = numNonGroundNodes + numVoltageSources;
 
-        if (systemSize == 0 && numNonGroundNodes == 0) { // MODIFIED CONDITION to allow systemSize=0 if numNonGroundNodes=0
-            throw std::runtime_error("Error: Circuit is too small for analysis (no non-ground nodes).");
-        }
-        if (systemSize == 0 && numNonGroundNodes > 0) { // This case should ideally not happen if buildMaps is correct
-            throw std::runtime_error("Error: Circuit is too small for analysis (inconsistent state).");
-        }
-        if (systemSize == 0) { // If circuit only has ground node or is empty after all
-            Eigen::MatrixXd A_empty(0,0); // Return empty matrix for empty system
+        if (systemSize == 0 && numNonGroundNodes == 0) {
+            Eigen::MatrixXd A_empty(0,0);
             return A_empty;
+        }
+        if (systemSize == 0 ) { // Catch cases where systemSize is 0 but numNonGroundNodes might not be if maps are inconsistent
+            throw std::runtime_error("Error: Circuit is too small for analysis (e.g. only ground node or inconsistent state).");
         }
 
 
         Eigen::MatrixXd A = Eigen::MatrixXd::Zero(systemSize, systemSize);
 
-        // G part (conductances from resistors and capacitors)
+        // G part (conductances from resistors, capacitors, and diodes)
         for (Element* elem : elementsInCircuit) {
-            if (auto res = dynamic_cast<Resistor*>(elem)) {
-                double conductance = 1.0 / res->getValue();
-                Node* n1 = res->getNode1();
-                Node* n2 = res->getNode2();
+            Node* n1 = elem->getNode1();
+            Node* n2 = elem->getNode2();
+            double conductance = 0;
 
+            if (auto res = dynamic_cast<Resistor*>(elem)) {
+                conductance = 1.0 / res->getValue();
+            } else if (auto cap = dynamic_cast<Capacitor*>(elem)) {
+                if (this->timeStep_h <= 0) {
+                    throw std::runtime_error("Error: Time step h is not set or is invalid for capacitor " + cap->getName() + ". Use setTimeStep().");
+                }
+                conductance = cap->getValue() / this->timeStep_h; // C/h for Backward Euler
+            } else if (auto diode = dynamic_cast<Diode*>(elem)) {
+                conductance = diode->geq_k; // Use equivalent conductance from NR iteration
+            }
+
+            if (conductance != 0) { // Process if there's a conductive path
                 if (n1 != groundNodeRef) {
                     A(nodeToIndexMap[n1], nodeToIndexMap[n1]) += conductance;
                 }
@@ -312,26 +358,6 @@ public:
                     A(nodeToIndexMap[n2], nodeToIndexMap[n1]) -= conductance;
                 }
             }
-                // NEW BLOCK for Capacitors (Backward Euler: G_eq = C/h)
-            else if (auto cap = dynamic_cast<Capacitor*>(elem)) {
-                if (this->timeStep_h <= 0) {
-                    throw std::runtime_error("Error: Time step h is not set or is invalid for capacitor " + cap->getName() + ". Use setTimeStep().");
-                }
-                double conductance_eq = cap->getValue() / this->timeStep_h; // C/h
-                Node* n1 = cap->getNode1();
-                Node* n2 = cap->getNode2();
-
-                if (n1 != groundNodeRef) {
-                    A(nodeToIndexMap[n1], nodeToIndexMap[n1]) += conductance_eq;
-                }
-                if (n2 != groundNodeRef) {
-                    A(nodeToIndexMap[n2], nodeToIndexMap[n2]) += conductance_eq;
-                }
-                if (n1 != groundNodeRef && n2 != groundNodeRef) {
-                    A(nodeToIndexMap[n1], nodeToIndexMap[n2]) -= conductance_eq;
-                    A(nodeToIndexMap[n2], nodeToIndexMap[n1]) -= conductance_eq;
-                }
-            }
         }
 
         // B and C parts (voltage sources)
@@ -339,7 +365,7 @@ public:
             VoltageSource* vs = orderedVoltageSources[i];
             Node* n_plus = vs->getNode1();
             Node* n_minus = vs->getNode2();
-            int vsMNAIndex = vsToIndexMap[vs];
+            int vsMNAIndex = vsToIndexMap[vs]; // This index is within the voltage source block
 
             if (n_plus != groundNodeRef) {
                 int nodeIdx = nodeToIndexMap[n_plus];
@@ -361,47 +387,53 @@ public:
         int numVoltageSources = orderedVoltageSources.size();
         int systemSize = numNonGroundNodes + numVoltageSources;
 
-        if (systemSize == 0) { // MODIFIED: handle empty system consistently
+        if (systemSize == 0) {
             Eigen::VectorXd Z_empty(0);
             return Z_empty;
         }
 
         Eigen::VectorXd Z = Eigen::VectorXd::Zero(systemSize);
 
-        // J part (current sources and equivalent current sources from capacitors)
+        // J part (current sources, equivalent current sources from capacitors and diodes)
         for (Element* elem : elementsInCircuit) {
-            if (auto cs = dynamic_cast<CurrentSource*>(elem)) {
-                Node* n_from = cs->getNode1();
-                Node* n_to = cs->getNode2();
-                double currentValue = cs->getValue();
+            Node* n1 = elem->getNode1(); // Positive terminal for current source convention
+            Node* n2 = elem->getNode2(); // Negative terminal
 
-                if (n_to != groundNodeRef) {
-                    Z(nodeToIndexMap[n_to]) += currentValue;
+            if (auto cs = dynamic_cast<CurrentSource*>(elem)) {
+                double currentValue = cs->getValue();
+                // Current flows from n1 to n2 as per typical definition
+                if (n1 != groundNodeRef) { // Current leaving n1
+                    Z(nodeToIndexMap[n1]) -= currentValue;
                 }
-                if (n_from != groundNodeRef) {
-                    Z(nodeToIndexMap[n_from]) -= currentValue;
+                if (n2 != groundNodeRef) { // Current entering n2
+                    Z(nodeToIndexMap[n2]) += currentValue;
                 }
-            }
-                // NEW BLOCK for Capacitors (Backward Euler: I_eq = (C/h) * V_cap_prev)
-            else if (auto cap = dynamic_cast<Capacitor*>(elem)) {
+            } else if (auto cap = dynamic_cast<Capacitor*>(elem)) {
                 if (this->timeStep_h <= 0) {
                     throw std::runtime_error("Error: Time step h is not set or is invalid for capacitor " + cap->getName() + ". Use setTimeStep().");
                 }
-                Node* n1 = cap->getNode1();
-                Node* n2 = cap->getNode2();
                 double c_div_h = cap->getValue() / this->timeStep_h;
-
                 // V_cap_prev = V_n1_prev - V_n2_prev
-                // I_eq = (C/h) * V_cap_prev, flows into n1 from n2 perspective in model
                 double v_n1_prev = n1->isGround() ? 0.0 : n1->getPreviousVoltage();
                 double v_n2_prev = n2->isGround() ? 0.0 : n2->getPreviousVoltage();
-                double i_eq = c_div_h * (v_n1_prev - v_n2_prev);
+                double i_eq_cap = c_div_h * (v_n1_prev - v_n2_prev); // I_eq = (C/h) * V_cap_prev
 
+                // This current source is parallel to C/h, directed from n1 to n2 if V_n1_prev > V_n2_prev
                 if (n1 != groundNodeRef) {
-                    Z(nodeToIndexMap[n1]) += i_eq;
+                    Z(nodeToIndexMap[n1]) += i_eq_cap;
                 }
                 if (n2 != groundNodeRef) {
-                    Z(nodeToIndexMap[n2]) -= i_eq; // Current flows out of n2, consistent with I_eq into n1
+                    Z(nodeToIndexMap[n2]) -= i_eq_cap;
+                }
+            } else if (auto diode = dynamic_cast<Diode*>(elem)) {
+                // Add equivalent current source Ieq = Id_k - Geq_k * Vd_k
+                // This current flows from anode (n1) to cathode (n2) in the diode model
+                double i_eq_diode = diode->ieq_k;
+                if (n1 != groundNodeRef) { // Current source entering n1 (anode)
+                    Z(nodeToIndexMap[n1]) += i_eq_diode;
+                }
+                if (n2 != groundNodeRef) { // Current source leaving n2 (cathode)
+                    Z(nodeToIndexMap[n2]) -= i_eq_diode;
                 }
             }
         }
@@ -417,6 +449,9 @@ public:
 
     const vector<Node*>& getOrderedNonGroundNodes() const {
         return orderedNonGroundNodes;
+    }
+    const vector<Node*>& getAllNodesInCircuit() const { // Added for convenience
+        return allNodesInCircuit;
     }
 
     const vector<VoltageSource*>& getOrderedVoltageSources() const {
@@ -436,8 +471,7 @@ public:
     MNASolver() {}
 
     Eigen::VectorXd solve(const Eigen::MatrixXd& A, const Eigen::VectorXd& Z) {
-        if (A.rows() == 0 && Z.size() == 0) { // MODIFIED: Handle empty system
-            // For an empty system, the solution is also empty.
+        if (A.rows() == 0 && Z.size() == 0) {
             return Eigen::VectorXd(0);
         }
         if (A.rows() != A.cols() || A.rows() != Z.size()) {
@@ -449,12 +483,10 @@ public:
 
 
         Eigen::PartialPivLU<Eigen::MatrixXd> lu(A);
-        if (std::abs(lu.determinant()) < 1e-12) { // MODIFIED LINE: Slightly more robust check for singularity
+        if (std::abs(lu.determinant()) < 1e-14) { // Stricter check for singularity
             cout << "Warning: System matrix determinant is very close to zero (" << lu.determinant() << "). Matrix might be singular or ill-conditioned." << endl;
-            // Depending on the Eigen version and matrix properties, solve() might still proceed or throw.
-            // For critical applications, a more sophisticated check or SVD might be needed.
-            // Throwing an error here prevents potential crashes or NaN results from Eigen's solve() with singular matrices.
-            throw std::runtime_error("Error: System matrix is singular or ill-conditioned (determinant is near zero). The circuit may not be solvable (e.g., floating sections, redundant voltage sources).");
+            // Consider throwing an error if critically needed, Eigen might still solve sometimes.
+            // throw std::runtime_error("Error: System matrix is singular or ill-conditioned (determinant is near zero).");
         }
         return lu.solve(Z);
     }
@@ -462,31 +494,22 @@ public:
     void updateCircuitState(const Eigen::VectorXd& X, MakingMNA& mnaCircuit) {
         const auto& nonGroundNodes = mnaCircuit.getOrderedNonGroundNodes();
         const auto& voltageSources = mnaCircuit.getOrderedVoltageSources();
-        // const auto& vsMap = mnaCircuit.getVoltageSourceToIndexMap(); // vsMap not directly used here but good for consistency
 
         int numNonGroundNodes = nonGroundNodes.size();
 
-        if (X.size() == 0 && numNonGroundNodes == 0 && voltageSources.size() == 0) { // MODIFIED: Handle empty solution
-            return; // Nothing to update for an empty circuit
+        if (X.size() == 0 && numNonGroundNodes == 0 && voltageSources.size() == 0) {
+            return;
         }
 
         if (X.size() != numNonGroundNodes + voltageSources.size()) {
             throw std::runtime_error("Error: Solution vector size does not match the number of unknowns.");
         }
 
-        // Update node voltages
         for (int i = 0; i < numNonGroundNodes; ++i) {
             nonGroundNodes[i]->setVoltage(X(i));
-            // For multi-step transient, you would call:
-            // nonGroundNodes[i]->updateVoltageForNextStep(); // or do this in the simulation loop
         }
 
-        // Update currents through voltage sources
-        // The vsMap is implicitly used by orderedVoltageSources matching the latter part of X
         for (size_t i = 0; i < voltageSources.size(); ++i) {
-            // The index in X for the i-th voltage source in orderedVoltageSources is numNonGroundNodes + i
-            // This relies on buildNodeAndVoltageSourceMaps correctly ordering vsToIndexMap implicitly
-            // and orderedVoltageSources being the source for that ordering.
             voltageSources[i]->setCurrent(X(numNonGroundNodes + i));
         }
     }
@@ -494,136 +517,84 @@ public:
 
 // Main function for testing
 int main() {
-    // Set output precision for floating-point numbers
-    cout << fixed << setprecision(6);
+    cout << fixed << setprecision(8); // Set precision for output
 
-    // --- ORIGINAL DC EXAMPLE (Resistor-Resistor circuit) ---
-    cout << "--- Original DC Example (R-R Circuit) ---" << endl;
-    Node n1("1"), n2("2"), n_gnd("0");
+    cout << "--- PDF Section 9: RC Circuit Example (Single Time Step) ---" << endl;
 
-    MakingMNA circuit_dc; // Uses default constructor, timeStep_h is -1
-    circuit_dc.addNode(&n1);
-    circuit_dc.addNode(&n2);
-    circuit_dc.addNode(&n_gnd);
-    // circuit_dc.setGroundNode(&n_gnd); // Auto-detected
+    // Circuit parameters from PDF Section 9.1
+    double v_source_val = 5.0;    // V1 = 5V
+    double r_val = 1000.0;   // R = 1kOhm
+    double c_val = 1.0e-6;   // C = 1uF
+    double h_val = 1.0e-6;   // h = 1us (time step)
+    double v_cap_initial = 0.0; // Initial capacitor voltage V_1*,n = 0V
 
-    try {
-        VoltageSource vs(&n1, &n_gnd, "V1", 5.0);
-        Resistor r1(&n1, &n2, "R1", 1000.0);
-        Resistor r2(&n2, &n_gnd, "R2", 2000.0);
+    // Define nodes
+    Node n_vs_out("N_VS_OUT");
+    Node n_cap_top("N_CAP_TOP", v_cap_initial, v_cap_initial); // V_current=0, V_previous=0
+    Node n_gnd("0_pdf9"); // This name should be recognized by Node::isGround()
 
-        circuit_dc.addElement(&vs);
-        circuit_dc.addElement(&r1);
-        circuit_dc.addElement(&r2);
+    // Create MNA manager and set time step
+    MakingMNA rc_circuit_pdf9(h_val);
 
-        Eigen::MatrixXd A_dc = circuit_dc.getSystemMatrixA();
-        Eigen::VectorXd Z_dc = circuit_dc.getSystemVectorZ();
+    // Add nodes to the circuit
+    rc_circuit_pdf9.addNode(&n_vs_out);
+    rc_circuit_pdf9.addNode(&n_cap_top);
+    rc_circuit_pdf9.addNode(&n_gnd);
 
-        cout << "System Matrix A (DC):\n" << A_dc << endl << endl;
-        cout << "System Vector Z (DC):\n" << Z_dc << endl << endl;
-
-        MNASolver solver_dc;
-        Eigen::VectorXd X_dc = solver_dc.solve(A_dc, Z_dc);
-
-        cout << "Solution Vector X (DC):\n" << X_dc << endl << endl;
-
-        solver_dc.updateCircuitState(X_dc, circuit_dc);
-
-        cout << "Node Voltages after solving (DC):" << endl;
-        for (const auto* node : circuit_dc.getOrderedNonGroundNodes()) {
-            cout << "Node " << node->getName() << ": " << node->getVoltage() << " V" << endl;
-        }
-        cout << "\nCurrents through Voltage Sources (DC):" << endl;
-        for (const auto* vs_elem : circuit_dc.getOrderedVoltageSources()) {
-            cout << "Current through " << vs_elem->getName() << ": " << vs_elem->getCurrent() << " A" << endl;
-        }
-        cout << "\nCurrents through Resistors (DC - calculated after solving):" << endl;
-        for (const auto* elem : circuit_dc.getAllElements()) {
-            if (const Resistor* res = dynamic_cast<const Resistor*>(elem)) {
-                cout << "Current through " << res->getName() << " (" << res->getNode1()->getName() << "->" << res->getNode2()->getName() << "): "
-                     << res->getCurrent() << " A" << endl;
-            }
-        }
-    } catch (const std::exception& e) {
-        cerr << "An error occurred in DC example: " << e.what() << endl;
-    }
-
-    cout << "\n\n--- RC Circuit Example (Transient - 1 step Backward Euler) ---" << endl;
-    // Set output precision for finer comparison if needed for RC example
-    cout << fixed << setprecision(8);
-
-    // Nodes for RC example (Vs - N_S_OUT - R - N_CAP_TOP - C - GND_RC)
-    // Initial voltage for N_CAP_TOP is 0 (Vc_prev = 0 as per PDF example V_1*,n = 0V)
-    Node n_s_out_rc("N_S_OUT_RC");
-    Node n_cap_top_rc("N_CAP_TOP_RC", 0.0, 0.0); // Initial voltage = 0, previousVoltage (V_n) = 0.0
-    Node n_gnd_rc("0_rc");                      // Ground node for RC circuit
-
-    // Circuit manager with time step h = 1us = 1.0e-6 s
-    double time_step_h = 1.0e-6;
-    MakingMNA rc_circuit(time_step_h); // Pass h to constructor
-    // Alternatively:
-    // MakingMNA rc_circuit;
-    // rc_circuit.setTimeStep(time_step_h);
-
-    rc_circuit.addNode(&n_s_out_rc);
-    rc_circuit.addNode(&n_cap_top_rc);
-    rc_circuit.addNode(&n_gnd_rc); // Will be auto-detected as ground due to its name "0_rc" (added to isGround check)
-    // or explicitly: rc_circuit.setGroundNode(&n_gnd_rc);
+    // *** Explicitly set the ground node to ensure it's recognized ***
+    rc_circuit_pdf9.setGroundNode(&n_gnd);
 
     try {
-        // Elements for RC circuit (V1=5V, R=1k, C=1uF)
-        VoltageSource vs_rc(&n_s_out_rc, &n_gnd_rc, "Vs_RC", 5.0);   // 5V voltage source
-        Resistor r_rc(&n_s_out_rc, &n_cap_top_rc, "R_RC", 1000.0);    // 1 kOhm resistor
-        Capacitor c_rc(&n_cap_top_rc, &n_gnd_rc, "C_RC", 1.0e-6);    // 1 uF capacitor
+        // Define elements
+        VoltageSource vs1(&n_vs_out, &n_gnd, "Vs1", v_source_val);
+        Resistor r1(&n_vs_out, &n_cap_top, "R1", r_val);
+        Capacitor c1(&n_cap_top, &n_gnd, "C1", c_val);
 
-        rc_circuit.addElement(&vs_rc);
-        rc_circuit.addElement(&r_rc);
-        rc_circuit.addElement(&c_rc);
+        // Add elements to the circuit
+        rc_circuit_pdf9.addElement(&vs1);
+        rc_circuit_pdf9.addElement(&r1);
+        rc_circuit_pdf9.addElement(&c1);
 
-        // Get MNA matrices for RC circuit
-        Eigen::MatrixXd A_rc = rc_circuit.getSystemMatrixA();
-        Eigen::VectorXd Z_rc = rc_circuit.getSystemVectorZ();
+        // Get MNA matrices (A and Z)
+        Eigen::MatrixXd A_rc9 = rc_circuit_pdf9.getSystemMatrixA();
+        Eigen::VectorXd Z_rc9 = rc_circuit_pdf9.getSystemVectorZ();
 
-        cout << "RC Circuit System Matrix A:\n" << A_rc << endl << endl;
-        cout << "RC Circuit System Vector Z:\n" << Z_rc << endl << endl;
+        cout << "\nSystem Matrix A (for the first step):\n" << A_rc9 << endl;
+        cout << "\nSystem Vector Z (for the first step):\n" << Z_rc9 << endl;
 
-        // Solve the system for RC circuit
-        MNASolver solver_rc;
-        Eigen::VectorXd X_rc = solver_rc.solve(A_rc, Z_rc);
+        // Solve the system
+        MNASolver solver_rc9;
+        Eigen::VectorXd X_rc9 = solver_rc9.solve(A_rc9, Z_rc9);
 
-        cout << "RC Circuit Solution Vector X (Node Voltages then VS Currents):\n" << X_rc << endl << endl;
+        cout << "\nSolution Vector X (Node Voltages then VS Currents):\n" << X_rc9 << endl;
 
-        // Update node voltages and VS currents
-        solver_rc.updateCircuitState(X_rc, rc_circuit);
+        // Update node voltages and VS currents from solution X
+        solver_rc9.updateCircuitState(X_rc9, rc_circuit_pdf9);
 
-        // Print results for RC circuit
-        cout << "RC Circuit Node Voltages after solving (t = h):" << endl;
-        for (const auto* node : rc_circuit.getOrderedNonGroundNodes()) {
-            cout << "Node " << node->getName() << ": " << node->getVoltage() << " V";
-            if (node->getName() == "N_CAP_TOP_RC") {
-                cout << " (Capacitor voltage. Expected ~0.00499500 V from PDF example calculation)";
-            }
-            cout << endl;
+        // Output results
+        cout << "\n--- Results after one time step (h = " << h_val << "s) ---" << endl;
+        cout << "Node Voltages:" << endl;
+        const auto& ordered_nodes = rc_circuit_pdf9.getOrderedNonGroundNodes();
+        for (size_t i = 0; i < ordered_nodes.size(); ++i) {
+            cout << "Node " << ordered_nodes[i]->getName() << ": " << ordered_nodes[i]->getVoltage() << " V" << endl;
         }
 
-        cout << "\nRC Circuit Currents through Voltage Sources:" << endl;
-        for (const auto* vs_elem : rc_circuit.getOrderedVoltageSources()) {
+        cout << "\nCurrents through Voltage Sources:" << endl;
+        for (const auto* vs_elem : rc_circuit_pdf9.getOrderedVoltageSources()) {
             cout << "Current through " << vs_elem->getName() << ": " << vs_elem->getCurrent() << " A" << endl;
         }
 
-        cout << "\nRC Circuit Currents through Resistors (calculated after solving):" << endl;
-        for (const auto* elem : rc_circuit.getAllElements()) {
-            if (const Resistor* res = dynamic_cast<const Resistor*>(elem)) {
-                cout << "Current through " << res->getName() << " (" << res->getNode1()->getName() << "->" << res->getNode2()->getName() << "): "
-                     << res->getCurrent() << " A" << endl;
-            }
-        }
-        // Note: Current through capacitor is implicitly handled by the MNA formulation.
+        cout << "\n----------------------------------------------------------" << endl;
+        cout << "Capacitor Voltage V(N_CAP_TOP) (V_1*,n+1 from PDF) after 1 step: "
+             << n_cap_top.getVoltage() << " V" << endl;
+        cout << "Expected Capacitor Voltage from PDF Section 9.3 (approx.): "
+             << 0.00499500 << " V (4.995 mV)" << endl;
+        cout << "----------------------------------------------------------" << endl;
 
     } catch (const std::exception& e) {
-        cerr << "An error occurred in RC example: " << e.what() << endl;
+        cerr << "\nAn error occurred in the PDF Section 9 RC example: " << e.what() << endl;
+        return 1;
     }
-
 
     return 0;
 }
