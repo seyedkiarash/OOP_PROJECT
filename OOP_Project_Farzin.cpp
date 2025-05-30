@@ -1,15 +1,12 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <stdexcept> // For std::invalid_argument and std::runtime_error
-#include <map>       // For node and voltage source to index mapping
-#include <iomanip>   // For output formatting (std::fixed, std::setprecision)
-#include <cmath>     // For std::exp, std::abs in Diode and NR
-#include <algorithm> // For std::find_if
+#include <stdexcept>
+#include <map>
+#include <cmath>
+#include <algorithm>
 #include "Eigen/Dense" // Core Eigen library for dense matrices and vectors
 
-// Using namespace std for simplicity in this example
-// In larger projects, it's better to use std:: prefix or more limited using declarations.
 using namespace std;
 
 // Node class definition
@@ -167,7 +164,7 @@ public:
     double getValue() const override { return capacitance; }
 };
 
-// *** NEW Inductor Class ***
+// Inductor Class
 class Inductor : public Element {
 private:
     double inductance;
@@ -197,7 +194,7 @@ public:
     }
 };
 
-// *** Diode Class (from original code) ***
+// Diode Class
 class Diode : public Element {
 private:
     double Is;   // Saturation current
@@ -233,26 +230,28 @@ public:
         double actual_vd = node1->getVoltage() - node2->getVoltage();
         return Is * (std::exp(actual_vd / Vt_n) - 1.0);
     }
+
+    double getThermalVoltageN() const { return Vt_n; }
 };
 
 
 // MakingMNA class
 class MakingMNA {
 private:
-    vector<Node*> allNodesInCircuit;
-    vector<Element*> elementsInCircuit;
-    Node* groundNodeRef;
+    vector<Node *> allNodesInCircuit;
+    vector<Element *> elementsInCircuit;
+    Node *groundNodeRef;
 
-    map<Node*, int> nodeToIndexMap;
-    vector<Node*> orderedNonGroundNodes;
-    map<VoltageSource*, int> vsToIndexMap;
-    vector<VoltageSource*> orderedVoltageSources;
-    map<Inductor*, int> inductorToIndexMap; // New
-    vector<Inductor*> orderedInductors;     // New
+    map<Node *, int> nodeToIndexMap;
+    vector<Node *> orderedNonGroundNodes;
+    map<VoltageSource *, int> vsToIndexMap;
+    vector<VoltageSource *> orderedVoltageSources;
+    map<Inductor *, int> inductorToIndexMap;
+    vector<Inductor *> orderedInductors;
+    vector<Diode *> orderedDiodes;
 
     double timeStep_h;
 
-    // *** MODIFIED: Renamed from buildNodeAndVoltageSourceMaps and expanded ***
     void buildSystemMaps() {
         nodeToIndexMap.clear();
         orderedNonGroundNodes.clear();
@@ -260,9 +259,10 @@ private:
         orderedVoltageSources.clear();
         inductorToIndexMap.clear();
         orderedInductors.clear();
+        orderedDiodes.clear();
 
         if (!groundNodeRef) {
-            for (Node* n : allNodesInCircuit) {
+            for (Node *n: allNodesInCircuit) {
                 if (n->isGround()) {
                     groundNodeRef = n;
                     break;
@@ -274,7 +274,7 @@ private:
         }
 
         int nodeIdx = 0;
-        for (Node* node : allNodesInCircuit) {
+        for (Node *node: allNodesInCircuit) {
             if (node != groundNodeRef) {
                 orderedNonGroundNodes.push_back(node);
                 nodeToIndexMap[node] = nodeIdx++;
@@ -282,21 +282,27 @@ private:
         }
 
         int vsIdx = 0;
-        for (Element* elem : elementsInCircuit) {
-            if (auto vs = dynamic_cast<VoltageSource*>(elem)) {
+        for (Element *elem: elementsInCircuit) {
+            if (auto vs = dynamic_cast<VoltageSource *>(elem)) {
                 orderedVoltageSources.push_back(vs);
                 vsToIndexMap[vs] = vsIdx++;
             }
         }
 
         int indIdx = 0;
-        for (Element* elem : elementsInCircuit) {
-            if (auto ind = dynamic_cast<Inductor*>(elem)) {
+        for (Element *elem: elementsInCircuit) {
+            if (auto ind = dynamic_cast<Inductor *>(elem)) {
                 orderedInductors.push_back(ind);
                 inductorToIndexMap[ind] = indIdx++;
             }
         }
+
+    for ( Element *elem: elementsInCircuit) {
+        if (auto d = dynamic_cast<Diode *>(elem)) {
+            orderedDiodes.push_back(d);
+        }
     }
+}
 
 public:
     MakingMNA(double h = -1.0) : groundNodeRef(nullptr), timeStep_h(h) {}
@@ -350,11 +356,10 @@ public:
                 break;
             }
         }
-        if(!found) addNode(gnd); // Add if not already in list
+        if(!found) addNode(gnd);
         groundNodeRef = gnd;
     }
 
-    // *** MODIFIED: To include inductors and correct VS stamping ***
     Eigen::MatrixXd getSystemMatrixA() {
         buildSystemMaps();
 
@@ -446,7 +451,6 @@ public:
         return A;
     }
 
-    // *** MODIFIED: To include inductors ***
     Eigen::VectorXd getSystemVectorZ() {
         // Ensure maps are built if this is called independently, though A usually builds them.
         if (nodeToIndexMap.empty() && !allNodesInCircuit.empty() && groundNodeRef && !orderedNonGroundNodes.empty()) {
@@ -539,14 +543,17 @@ public:
     const vector<VoltageSource*>& getOrderedVoltageSources() const {
         return orderedVoltageSources;
     }
-    const vector<Inductor*>& getOrderedInductors() const { // New getter
+    const vector<Inductor*>& getOrderedInductors() const {
         return orderedInductors;
     }
-    const map<VoltageSource*, int>& getVoltageSourceToIndexMap() const { // Unused in main, but kept
+    const map<VoltageSource*, int>& getVoltageSourceToIndexMap() const {
         return vsToIndexMap;
     }
     const vector<Element*>& getAllElements() const {
         return elementsInCircuit;
+    }
+    const vector<Diode*>& getOrderedDiodes() const {
+        return orderedDiodes;
     }
 };
 
@@ -574,7 +581,6 @@ public:
         return lu.solve(Z);
     }
 
-    // *** MODIFIED: To update inductor currents ***
     void updateCircuitState(const Eigen::VectorXd& X, MakingMNA& mnaCircuit) {
         const auto& nonGroundNodes = mnaCircuit.getOrderedNonGroundNodes();
         const auto& voltageSources = mnaCircuit.getOrderedVoltageSources();
