@@ -297,12 +297,12 @@ private:
             }
         }
 
-    for ( Element *elem: elementsInCircuit) {
-        if (auto d = dynamic_cast<Diode *>(elem)) {
-            orderedDiodes.push_back(d);
+        for ( Element *elem: elementsInCircuit) {
+            if (auto d = dynamic_cast<Diode *>(elem)) {
+                orderedDiodes.push_back(d);
+            }
         }
     }
-}
 
 public:
     MakingMNA(double h = -1.0) : groundNodeRef(nullptr), timeStep_h(h) {}
@@ -613,3 +613,161 @@ public:
         }
     }
 };
+
+// ===================================================================================
+// ===== NEW CODE FOR ADAPTIVE TIME-STEPPING STARTS HERE =============================
+// ===================================================================================
+
+class TransientAnalysis {
+private:
+    MakingMNA& mnaCircuit;
+    MNASolver solver;
+
+    // Parameters for adaptive time-stepping
+    double initial_h;
+    double min_h;
+    double max_h;
+    double tolerance;
+    double h_increase_factor;
+    double h_decrease_factor;
+
+public:
+    TransientAnalysis(MakingMNA& circuit, double initial_step, double min_step, double max_step, double tol)
+            : mnaCircuit(circuit), solver(), initial_h(initial_step), min_h(min_step),
+              max_h(max_step), tolerance(tol), h_increase_factor(1.5), h_decrease_factor(2.0) {
+        if (min_h <= 0 || max_h <= min_h || initial_h < min_h || initial_h > max_h) {
+            throw std::invalid_argument("Invalid time step parameters for adaptive analysis.");
+        }
+    }
+
+    void run(double t_stop) {
+        double current_time = 0.0;
+        double h = initial_h;
+
+        // --- Print Header ---
+        cout << "Time (s)\t";
+        const auto& nonGroundNodes = mnaCircuit.getOrderedNonGroundNodes();
+        for (const auto& node : nonGroundNodes) {
+            cout << "V(" << node->getName() << ")\t";
+        }
+        cout << "(h)" << endl;
+        cout << "--------------------------------------------------------" << endl;
+
+
+        while (current_time < t_stop) {
+            // Adjust h if it would overshoot t_stop
+            if (current_time + h > t_stop) {
+                h = t_stop - current_time;
+            }
+
+            // Store current voltages to estimate error after the trial step
+            std::vector<double> old_voltages;
+            for(const auto& node : nonGroundNodes) {
+                old_voltages.push_back(node->getVoltage());
+            }
+
+            bool step_accepted = false;
+            while (!step_accepted) {
+                // Prevent h from going below the minimum allowed step
+                if (h < min_h) {
+                    h = min_h;
+                }
+
+                mnaCircuit.setTimeStep(h);
+                Eigen::MatrixXd A = mnaCircuit.getSystemMatrixA();
+                Eigen::VectorXd Z = mnaCircuit.getSystemVectorZ();
+                Eigen::VectorXd X = solver.solve(A, Z);
+
+                // Simple error estimation based on max voltage change
+                double max_voltage_change = 0.0;
+                for (size_t i = 0; i < nonGroundNodes.size(); ++i) {
+                    double change = std::abs(X(i) - old_voltages[i]);
+                    if (change > max_voltage_change) {
+                        max_voltage_change = change;
+                    }
+                }
+
+                // Accept the step if error is within tolerance OR if we are already at the minimum step size
+                if (max_voltage_change <= tolerance || h == min_h) {
+                    step_accepted = true;
+                    solver.updateCircuitState(X, mnaCircuit);
+                    current_time += h;
+
+                    // Update the "previous" values for all reactive components for the next step
+                    for (auto& node : mnaCircuit.getAllNodesInCircuit()) {
+                        node->updateVoltageForNextStep();
+                    }
+                    for (auto& ind : mnaCircuit.getOrderedInductors()) {
+                        ind->updateCurrentForNextStep();
+                    }
+
+                    // --- Print results for this accepted step ---
+                    cout << current_time << "\t\t";
+                    for (const auto& node : nonGroundNodes) {
+                        cout << node->getVoltage() << "\t\t";
+                    }
+                    cout << "(h=" << h << ")" << endl;
+
+                    // Dynamically increase h for the next step if the change was very small
+                    if (max_voltage_change < tolerance / 10.0 && h < max_h) {
+                        h *= h_increase_factor;
+                        if (h > max_h) h = max_h;
+                    }
+                } else {
+                    // Reject the step, reduce h, and retry
+                    h /= h_decrease_factor;
+                }
+
+                // Safety break to prevent infinite loops if h becomes pathologically small
+                if (h < 1e-18) {
+                    cerr << "Error: Timestep has become excessively small. Aborting analysis to prevent infinite loop." << endl;
+                    return;
+                }
+            }
+        }
+    }
+};
+
+
+// Example main function to demonstrate the TransientAnalysis class
+int main() {
+    try {
+        // --- Setup for the RC Circuit from the PDF ---
+        // V1 -- R1 -- (node 1) -- C1 -- GND
+        Node n_source_plus("source+");
+        Node n_1("1");
+        Node n_gnd_rc("0_rc");
+
+        // Set initial conditions for the node (capacitor voltage is initially 0)
+        n_1.setVoltage(0.0);
+        n_1.setPreviousVoltage(0.0);
+
+        // Create elements
+        VoltageSource V1(&n_source_plus, &n_gnd_rc, "V1", 5.0);
+        Resistor R1_rc(&n_source_plus, &n_1, "R1", 1000.0);
+        Capacitor C1_rc(&n_1, &n_gnd_rc, "C1", 1e-6);
+
+        // Build the circuit using the MNA helper class
+        MakingMNA mna_rc_circuit;
+        mna_rc_circuit.addNode(&n_source_plus);
+        mna_rc_circuit.addNode(&n_1);
+        mna_rc_circuit.addNode(&n_gnd_rc);
+        mna_rc_circuit.setGroundNode(&n_gnd_rc);
+        mna_rc_circuit.addElement(&V1);
+        mna_rc_circuit.addElement(&R1_rc);
+        mna_rc_circuit.addElement(&C1_rc);
+
+        cout << "--- Running Adaptive Time Step Simulation for RC Circuit ---" << endl;
+        // Create the analysis driver with adaptive parameters:
+        // TransientAnalysis(circuit, initial_step, min_step, max_step, voltage_tolerance)
+        TransientAnalysis adaptive_sim(mna_rc_circuit, 1e-6, 1e-9, 1e-4, 0.01);
+
+        // Run the simulation until t=0.005s (5ms)
+        adaptive_sim.run(0.005);
+
+    } catch (const std::exception& e) {
+        cerr << "\n*** An exception occurred: " << e.what() << " ***" << endl;
+        return 1;
+    }
+    return 0;
+}
