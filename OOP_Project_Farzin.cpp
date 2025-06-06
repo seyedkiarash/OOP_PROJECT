@@ -50,7 +50,7 @@ public:
     bool isGround() const {
         return name == "0" || name == "GND" || name == "gnd" ||
                name == "0_rc" || name == "0_diode" ||
-               name == "0_pdf9" || name == "0_pdf10"; // Added new ground names from examples
+               name == "0_pdf9" || name == "0_pdf10";
     }
 };
 
@@ -77,12 +77,12 @@ public:
     Node* getNode2() const { return node2; }
 
     virtual string getType() const = 0;
-    virtual double getValue() const { return 0.0; } // Default, not all elements have a single "value"
+    virtual double getValue() const { return 0.0; }
     virtual double getCurrent() const {
-        return 0.0; // Default implementation
+        return 0.0;
     }
     virtual void setCurrent(double current) {
-        (void)current; // Default implementation to avoid unused parameter warning
+        (void)current;
     }
 };
 
@@ -102,6 +102,14 @@ public:
     string getType() const override { return "Resistor"; }
     double getValue() const override { return resistance; }
 
+    // New method to allow modification for parameter sweeps
+    void setResistance(double res) {
+        if (res <= 0) {
+            throw std::invalid_argument("Error: Resistance value must be positive for " + name);
+        }
+        this->resistance = res;
+    }
+
     double getCurrent() const override {
         if (node1 && node2) {
             return (node1->getVoltage() - node2->getVoltage()) / resistance;
@@ -119,11 +127,15 @@ private:
 public:
     VoltageSource(Node* n1, Node* n2, const string &name, double val) : Element(n1, n2, name) {
         this->voltageValue = val;
-        this->currentThroughSource = 0.0; // Initial value
+        this->currentThroughSource = 0.0;
     }
 
     string getType() const override { return "VoltageSource"; }
     double getValue() const override { return voltageValue; }
+
+    void setVoltageValue(double val) {
+        this->voltageValue = val;
+    }
 
     double getCurrent() const override {
         return currentThroughSource;
@@ -168,8 +180,8 @@ public:
 class Inductor : public Element {
 private:
     double inductance;
-    double current;         // Current I_L at t_n+1
-    double previousCurrent; // Current I_L at t_n
+    double current;
+    double previousCurrent;
 
 public:
     Inductor(Node* n1, Node* n2, const string &name, double ind)
@@ -180,7 +192,7 @@ public:
     }
 
     string getType() const override { return "Inductor"; }
-    double getValue() const override { return inductance; } // Returns L
+    double getValue() const override { return inductance; }
 
     double getCurrent() const override { return current; }
     void setCurrent(double c) { current = c; }
@@ -188,50 +200,36 @@ public:
     double getPreviousCurrent() const { return previousCurrent; }
     void setPreviousCurrent(double pc) { previousCurrent = pc; }
 
-    // Method to update state for next time step (call after each successful time step solution)
     void updateCurrentForNextStep() {
         previousCurrent = current;
     }
 };
 
-// Diode Class
-class Diode : public Element {
+// Ideal Diode Class
+class IdealDiode : public Element {
+public:
+    enum State { ON, OFF };
+
 private:
-    double Is;   // Saturation current
-    double Vt_n; // Thermal voltage * ideality factor (n*Vt)
+    double forwardVoltage;
+    State currentState;
+    double current;
 
 public:
-    // For Newton-Raphson
-    double voltage_k;       // Voltage guess Vd^(k)
-    double current_at_voltage_k; // Id(Vd^(k))
-    double geq_k;           // Equivalent conductance at Vd^(k)
-    double ieq_k;           // Equivalent current source at Vd^(k)
-
-    Diode(Node* n1, Node* n2, const string &name, double saturation_current = 1e-14, double thermal_voltage_n = 0.026)
-            : Element(n1, n2, name), Is(saturation_current), Vt_n(thermal_voltage_n),
-              voltage_k(0.7), current_at_voltage_k(0.0), geq_k(0.0), ieq_k(0.0) { // Initial guess for Vd
-        if (Is <= 0 || Vt_n <=0) {
-            throw std::invalid_argument("Diode parameters Is and Vt_n must be positive for Diode: " + name);
+    IdealDiode(Node* n1, Node* n2, const string& name, double vf)
+            : Element(n1, n2, name), forwardVoltage(vf), currentState(OFF), current(0.0) {
+        if (vf < 0) {
+            throw std::invalid_argument("Diode forward voltage cannot be negative for diode: " + name);
         }
-        updateIterationParameters(voltage_k); // Initialize NR parameters
     }
 
-    string getType() const override { return "Diode"; }
+    string getType() const override { return "IdealDiode"; }
+    double getForwardVoltage() const { return forwardVoltage; }
+    State getState() const { return currentState; }
+    void setState(State state) { currentState = state; }
 
-    void updateIterationParameters(double vd_guess) {
-        voltage_k = vd_guess;
-        double exp_term = std::exp(voltage_k / Vt_n);
-        current_at_voltage_k = Is * (exp_term - 1.0);
-        geq_k = (Is / Vt_n) * exp_term;
-        ieq_k = current_at_voltage_k - geq_k * voltage_k;
-    }
-
-    double getCurrent() const override {
-        double actual_vd = node1->getVoltage() - node2->getVoltage();
-        return Is * (std::exp(actual_vd / Vt_n) - 1.0);
-    }
-
-    double getThermalVoltageN() const { return Vt_n; }
+    double getCurrent() const override { return current; }
+    void setCurrent(double c) override { current = c; }
 };
 
 
@@ -248,7 +246,8 @@ private:
     vector<VoltageSource *> orderedVoltageSources;
     map<Inductor *, int> inductorToIndexMap;
     vector<Inductor *> orderedInductors;
-    vector<Diode *> orderedDiodes;
+    map<IdealDiode *, int> idealDiodeToIndexMap;
+    vector<IdealDiode *> orderedIdealDiodes;
 
     double timeStep_h;
 
@@ -259,7 +258,8 @@ private:
         orderedVoltageSources.clear();
         inductorToIndexMap.clear();
         orderedInductors.clear();
-        orderedDiodes.clear();
+        idealDiodeToIndexMap.clear();
+        orderedIdealDiodes.clear();
 
         if (!groundNodeRef) {
             for (Node *n: allNodesInCircuit) {
@@ -281,44 +281,28 @@ private:
             }
         }
 
-        int vsIdx = 0;
         for (Element *elem: elementsInCircuit) {
             if (auto vs = dynamic_cast<VoltageSource *>(elem)) {
                 orderedVoltageSources.push_back(vs);
-                vsToIndexMap[vs] = vsIdx++;
-            }
-        }
-
-        int indIdx = 0;
-        for (Element *elem: elementsInCircuit) {
-            if (auto ind = dynamic_cast<Inductor *>(elem)) {
+            } else if (auto ind = dynamic_cast<Inductor *>(elem)) {
                 orderedInductors.push_back(ind);
-                inductorToIndexMap[ind] = indIdx++;
+            } else if (auto id = dynamic_cast<IdealDiode *>(elem)) {
+                orderedIdealDiodes.push_back(id);
             }
         }
 
-        for ( Element *elem: elementsInCircuit) {
-            if (auto d = dynamic_cast<Diode *>(elem)) {
-                orderedDiodes.push_back(d);
-            }
-        }
+        for (size_t i = 0; i < orderedVoltageSources.size(); ++i) vsToIndexMap[orderedVoltageSources[i]] = i;
+        for (size_t i = 0; i < orderedInductors.size(); ++i) inductorToIndexMap[orderedInductors[i]] = i;
+        for (size_t i = 0; i < orderedIdealDiodes.size(); ++i) idealDiodeToIndexMap[orderedIdealDiodes[i]] = i;
     }
 
 public:
     MakingMNA(double h = -1.0) : groundNodeRef(nullptr), timeStep_h(h) {}
 
     ~MakingMNA() {
-        // Memory management of nodes and elements is assumed to be handled outside
     }
 
     void setTimeStep(double h) {
-        // Simplified check, more robust checks are inside getSystemMatrixA/Z for specific elements
-        if (h <= 0 && std::any_of(elementsInCircuit.begin(), elementsInCircuit.end(), [](Element* e){
-            return dynamic_cast<Capacitor*>(e) != nullptr || dynamic_cast<Inductor*>(e) != nullptr;
-        })) {
-            // This is a general warning/check. Specific checks are better placed when an element requiring h is processed.
-            cout << "Warning: Setting non-positive time step for a circuit that might contain reactive elements." << endl;
-        }
         this->timeStep_h = h;
     }
 
@@ -345,6 +329,15 @@ public:
         elementsInCircuit.push_back(element);
     }
 
+    Element* getElement(const string& name) {
+        for (auto* elem : elementsInCircuit) {
+            if (elem->getName() == name) {
+                return elem;
+            }
+        }
+        return nullptr;
+    }
+
     void setGroundNode(Node* gnd) {
         if (!gnd) {
             throw std::invalid_argument("Ground node cannot be null.");
@@ -360,22 +353,19 @@ public:
         groundNodeRef = gnd;
     }
 
-    Eigen::MatrixXd getSystemMatrixA() {
+    Eigen::MatrixXd getSystemMatrixA(bool isDCAnalysis = false) {
         buildSystemMaps();
 
         int numNonGroundNodes = orderedNonGroundNodes.size();
         int numVoltageSources = orderedVoltageSources.size();
         int numInductors = orderedInductors.size();
-        int systemSize = numNonGroundNodes + numVoltageSources + numInductors;
+        int numIdealDiodes = orderedIdealDiodes.size();
+        int systemSize = numNonGroundNodes + numVoltageSources + numInductors + numIdealDiodes;
 
-        if (systemSize == 0) { // Simplified check: if system size is 0, it's empty
-            Eigen::MatrixXd A_empty(0,0);
-            return A_empty;
-        }
+        if (systemSize == 0) return Eigen::MatrixXd(0,0);
 
         Eigen::MatrixXd A = Eigen::MatrixXd::Zero(systemSize, systemSize);
 
-        // G part (conductances from resistors, capacitors, and diodes)
         for (Element* elem : elementsInCircuit) {
             Node* n1 = elem->getNode1();
             Node* n2 = elem->getNode2();
@@ -384,177 +374,142 @@ public:
             if (auto res = dynamic_cast<Resistor*>(elem)) {
                 conductance = 1.0 / res->getValue();
             } else if (auto cap = dynamic_cast<Capacitor*>(elem)) {
-                if (this->timeStep_h <= 0) {
-                    throw std::runtime_error("Error: Time step h is not set or is invalid for capacitor " + cap->getName() + ". Use setTimeStep().");
+                if (!isDCAnalysis) { // Capacitors are open circuits in DC
+                    if (this->timeStep_h <= 0) throw std::runtime_error("Time step h is not set for capacitor " + cap->getName());
+                    conductance = cap->getValue() / this->timeStep_h;
                 }
-                conductance = cap->getValue() / this->timeStep_h;
-            } else if (auto diode = dynamic_cast<Diode*>(elem)) {
-                conductance = diode->geq_k;
             }
 
             if (conductance != 0) {
-                if (n1 != groundNodeRef) {
-                    A(nodeToIndexMap[n1], nodeToIndexMap[n1]) += conductance;
-                }
-                if (n2 != groundNodeRef) {
-                    A(nodeToIndexMap[n2], nodeToIndexMap[n2]) += conductance;
-                }
-                if (n1 != groundNodeRef && n2 != groundNodeRef) {
+                if (!n1->isGround()) A(nodeToIndexMap[n1], nodeToIndexMap[n1]) += conductance;
+                if (!n2->isGround()) A(nodeToIndexMap[n2], nodeToIndexMap[n2]) += conductance;
+                if (!n1->isGround() && !n2->isGround()) {
                     A(nodeToIndexMap[n1], nodeToIndexMap[n2]) -= conductance;
                     A(nodeToIndexMap[n2], nodeToIndexMap[n1]) -= conductance;
                 }
             }
         }
 
-        // Stamps for Voltage Sources
-        for (size_t i = 0; i < orderedVoltageSources.size(); ++i) {
-            VoltageSource* vs = orderedVoltageSources[i];
-            Node* n_plus = vs->getNode1();
-            Node* n_minus = vs->getNode2();
+        for (const auto& vs : orderedVoltageSources) {
             int vsCurrentVarIndex = numNonGroundNodes + vsToIndexMap[vs];
-            int vsBranchEqRow = numNonGroundNodes + vsToIndexMap[vs];
-
-            if (n_plus != groundNodeRef) {
-                A(nodeToIndexMap[n_plus], vsCurrentVarIndex) += 1.0; // KCL at n_plus: +I_vs
-                A(vsBranchEqRow, nodeToIndexMap[n_plus]) += 1.0;     // Branch Eq: +V_nplus
+            int vsBranchEqRow = vsCurrentVarIndex;
+            if (!vs->getNode1()->isGround()) {
+                A(nodeToIndexMap[vs->getNode1()], vsCurrentVarIndex) += 1.0;
+                A(vsBranchEqRow, nodeToIndexMap[vs->getNode1()]) += 1.0;
             }
-            if (n_minus != groundNodeRef) {
-                A(nodeToIndexMap[n_minus], vsCurrentVarIndex) -= 1.0; // KCL at n_minus: -I_vs
-                A(vsBranchEqRow, nodeToIndexMap[n_minus]) -= 1.0;     // Branch Eq: -V_nminus
+            if (!vs->getNode2()->isGround()) {
+                A(nodeToIndexMap[vs->getNode2()], vsCurrentVarIndex) -= 1.0;
+                A(vsBranchEqRow, nodeToIndexMap[vs->getNode2()]) -= 1.0;
             }
-            // A(vsBranchEqRow, vsCurrentVarIndex) is 0 for ideal VS (D matrix part)
         }
 
-        // Stamps for Inductors
-        for (size_t i = 0; i < orderedInductors.size(); ++i) {
-            Inductor* ind = orderedInductors[i];
-            Node* n1_ind = ind->getNode1();
-            Node* n2_ind = ind->getNode2();
-            int indCurrentVarIndex = numNonGroundNodes + numVoltageSources + inductorToIndexMap[ind];
-            int indBranchEqRow = numNonGroundNodes + numVoltageSources + inductorToIndexMap[ind];
-
-            if (this->timeStep_h <= 0) {
-                throw std::runtime_error("Error: Time step h is not set or is invalid for inductor " + ind->getName() + ". Use setTimeStep().");
+        for (const auto& ind : orderedInductors) {
+            int base_idx = numNonGroundNodes + numVoltageSources;
+            int indCurrentVarIndex = base_idx + inductorToIndexMap[ind];
+            int indBranchEqRow = indCurrentVarIndex;
+            if (isDCAnalysis) { // Inductors are short circuits in DC (0V drop)
+                if (!ind->getNode1()->isGround()) A(indBranchEqRow, nodeToIndexMap[ind->getNode1()]) += 1.0;
+                if (!ind->getNode2()->isGround()) A(indBranchEqRow, nodeToIndexMap[ind->getNode2()]) -= 1.0;
+            } else { // Transient analysis
+                if (this->timeStep_h <= 0) throw std::runtime_error("Time step h is not set for inductor " + ind->getName());
+                double l_div_h = ind->getValue() / this->timeStep_h;
+                if (!ind->getNode1()->isGround()) {
+                    A(nodeToIndexMap[ind->getNode1()], indCurrentVarIndex) += 1.0;
+                    A(indBranchEqRow, nodeToIndexMap[ind->getNode1()]) += 1.0;
+                }
+                if (!ind->getNode2()->isGround()) {
+                    A(nodeToIndexMap[ind->getNode2()], indCurrentVarIndex) -= 1.0;
+                    A(indBranchEqRow, nodeToIndexMap[ind->getNode2()]) -= 1.0;
+                }
+                A(indBranchEqRow, indCurrentVarIndex) -= l_div_h;
             }
-            double l_div_h = ind->getValue() / this->timeStep_h;
-
-            if (n1_ind != groundNodeRef) {
-                A(nodeToIndexMap[n1_ind], indCurrentVarIndex) += 1.0; // KCL at n1_ind: +I_L
-                A(indBranchEqRow, nodeToIndexMap[n1_ind]) += 1.0;     // Branch Eq: +V_n1_ind
-            }
-            if (n2_ind != groundNodeRef) {
-                A(nodeToIndexMap[n2_ind], indCurrentVarIndex) -= 1.0; // KCL at n2_ind: -I_L
-                A(indBranchEqRow, nodeToIndexMap[n2_ind]) -= 1.0;     // Branch Eq: -V_n2_ind
-            }
-            A(indBranchEqRow, indCurrentVarIndex) -= l_div_h;         // Branch Eq: -(L/h)I_L
         }
+
+        for (const auto& diode : orderedIdealDiodes) {
+            int base_idx = numNonGroundNodes + numVoltageSources + numInductors;
+            int diodeCurrentVarIndex = base_idx + idealDiodeToIndexMap[diode];
+            int diodeBranchEqRow = diodeCurrentVarIndex;
+
+            if (diode->getState() == IdealDiode::ON) {
+                if (!diode->getNode1()->isGround()) {
+                    A(nodeToIndexMap[diode->getNode1()], diodeCurrentVarIndex) += 1.0;
+                    A(diodeBranchEqRow, nodeToIndexMap[diode->getNode1()]) += 1.0;
+                }
+                if (!diode->getNode2()->isGround()) {
+                    A(nodeToIndexMap[diode->getNode2()], diodeCurrentVarIndex) -= 1.0;
+                    A(diodeBranchEqRow, nodeToIndexMap[diode->getNode2()]) -= 1.0;
+                }
+            } else {
+                A(diodeBranchEqRow, diodeCurrentVarIndex) = 1.0;
+            }
+        }
+
         return A;
     }
 
-    Eigen::VectorXd getSystemVectorZ() {
-        // Ensure maps are built if this is called independently, though A usually builds them.
-        if (nodeToIndexMap.empty() && !allNodesInCircuit.empty() && groundNodeRef && !orderedNonGroundNodes.empty()) {
-            // Potentially stale maps, or A was not called.
-        } else if (nodeToIndexMap.empty() && !allNodesInCircuit.empty() && groundNodeRef) {
-            buildSystemMaps(); // Build if completely uninitialized
-        }
-
-
+    Eigen::VectorXd getSystemVectorZ(bool isDCAnalysis = false) {
         int numNonGroundNodes = orderedNonGroundNodes.size();
         int numVoltageSources = orderedVoltageSources.size();
         int numInductors = orderedInductors.size();
-        int systemSize = numNonGroundNodes + numVoltageSources + numInductors;
+        int numIdealDiodes = orderedIdealDiodes.size();
+        int systemSize = numNonGroundNodes + numVoltageSources + numInductors + numIdealDiodes;
 
-        if (systemSize == 0) {
-            Eigen::VectorXd Z_empty(0);
-            return Z_empty;
-        }
+        if (systemSize == 0) return Eigen::VectorXd(0);
 
         Eigen::VectorXd Z = Eigen::VectorXd::Zero(systemSize);
 
-        // J part (current sources, equivalent Cs from capacitors and diodes)
         for (Element* elem : elementsInCircuit) {
-            Node* n1 = elem->getNode1();
-            Node* n2 = elem->getNode2();
-
             if (auto cs = dynamic_cast<CurrentSource*>(elem)) {
-                double currentValue = cs->getValue();
-                if (n1 != groundNodeRef) {
-                    Z(nodeToIndexMap[n1]) -= currentValue;
-                }
-                if (n2 != groundNodeRef) {
-                    Z(nodeToIndexMap[n2]) += currentValue;
-                }
+                if (!cs->getNode1()->isGround()) Z(nodeToIndexMap[cs->getNode1()]) -= cs->getValue();
+                if (!cs->getNode2()->isGround()) Z(nodeToIndexMap[cs->getNode2()]) += cs->getValue();
             } else if (auto cap = dynamic_cast<Capacitor*>(elem)) {
-                if (this->timeStep_h <= 0) {
-                    throw std::runtime_error("Error: Time step h is not set or is invalid for capacitor " + cap->getName() + ". Use setTimeStep().");
-                }
-                double c_div_h = cap->getValue() / this->timeStep_h;
-                double v_n1_prev = n1->isGround() ? 0.0 : n1->getPreviousVoltage();
-                double v_n2_prev = n2->isGround() ? 0.0 : n2->getPreviousVoltage();
-                double i_eq_cap = c_div_h * (v_n1_prev - v_n2_prev);
-
-                if (n1 != groundNodeRef) {
-                    Z(nodeToIndexMap[n1]) += i_eq_cap;
-                }
-                if (n2 != groundNodeRef) {
-                    Z(nodeToIndexMap[n2]) -= i_eq_cap;
-                }
-            } else if (auto diode = dynamic_cast<Diode*>(elem)) {
-                double i_eq_diode = diode->ieq_k;
-                if (n1 != groundNodeRef) {
-                    Z(nodeToIndexMap[n1]) += i_eq_diode;
-                }
-                if (n2 != groundNodeRef) {
-                    Z(nodeToIndexMap[n2]) -= i_eq_diode;
+                if (!isDCAnalysis) {
+                    if (this->timeStep_h <= 0) throw std::runtime_error("Time step h is not set for capacitor " + cap->getName());
+                    double c_div_h = cap->getValue() / this->timeStep_h;
+                    double v_n1_prev = cap->getNode1()->getPreviousVoltage();
+                    double v_n2_prev = cap->getNode2()->getPreviousVoltage();
+                    double i_eq_cap = c_div_h * (v_n1_prev - v_n2_prev);
+                    if (!cap->getNode1()->isGround()) Z(nodeToIndexMap[cap->getNode1()]) += i_eq_cap;
+                    if (!cap->getNode2()->isGround()) Z(nodeToIndexMap[cap->getNode2()]) -= i_eq_cap;
                 }
             }
         }
 
-        // E part (voltage source values on RHS of their branch equations)
-        for (size_t i = 0; i < orderedVoltageSources.size(); ++i) {
-            VoltageSource* vs = orderedVoltageSources[i];
-            int vsBranchEqRow = numNonGroundNodes + vsToIndexMap[vs];
-            Z(vsBranchEqRow) = vs->getValue();
+        for (const auto& vs : orderedVoltageSources) {
+            Z(numNonGroundNodes + vsToIndexMap[vs]) = vs->getValue();
         }
 
-        // RHS for Inductor branch equations
-        // Branch eq: V(n1) - V(n2) - (L/h)I_L,n+1 = -(L/h)I_L,n
-        for (size_t i = 0; i < orderedInductors.size(); ++i) {
-            Inductor* ind = orderedInductors[i];
+        for (const auto& ind : orderedInductors) {
             int indBranchEqRow = numNonGroundNodes + numVoltageSources + inductorToIndexMap[ind];
-
-            if (this->timeStep_h <= 0) {
-                throw std::runtime_error("Error: Time step h is not set or is invalid for inductor " + ind->getName() + ". Use setTimeStep().");
+            if (isDCAnalysis) {
+                Z(indBranchEqRow) = 0; // V_L = 0 in DC
+            } else {
+                if (this->timeStep_h <= 0) throw std::runtime_error("Time step h is not set for inductor " + ind->getName());
+                double l_div_h = ind->getValue() / this->timeStep_h;
+                Z(indBranchEqRow) = -(l_div_h * ind->getPreviousCurrent());
             }
-            double l_div_h = ind->getValue() / this->timeStep_h;
-            Z(indBranchEqRow) = -(l_div_h * ind->getPreviousCurrent());
         }
+
+        for (const auto& diode : orderedIdealDiodes) {
+            int base_idx = numNonGroundNodes + numVoltageSources + numInductors;
+            int diodeBranchEqRow = base_idx + idealDiodeToIndexMap[diode];
+            if (diode->getState() == IdealDiode::ON) {
+                Z(diodeBranchEqRow) = diode->getForwardVoltage();
+            } else {
+                Z(diodeBranchEqRow) = 0.0;
+            }
+        }
+
         return Z;
     }
 
-    const vector<Node*>& getOrderedNonGroundNodes() const {
-        return orderedNonGroundNodes;
-    }
-    const vector<Node*>& getAllNodesInCircuit() const {
-        return allNodesInCircuit;
-    }
+    const vector<Node*>& getOrderedNonGroundNodes() const { return orderedNonGroundNodes; }
+    const vector<Node*>& getAllNodesInCircuit() const { return allNodesInCircuit; }
+    const vector<VoltageSource*>& getOrderedVoltageSources() const { return orderedVoltageSources; }
+    const vector<Inductor*>& getOrderedInductors() const { return orderedInductors; }
+    const vector<IdealDiode*>& getOrderedIdealDiodes() const { return orderedIdealDiodes; }
 
-    const vector<VoltageSource*>& getOrderedVoltageSources() const {
-        return orderedVoltageSources;
-    }
-    const vector<Inductor*>& getOrderedInductors() const {
-        return orderedInductors;
-    }
-    const map<VoltageSource*, int>& getVoltageSourceToIndexMap() const {
-        return vsToIndexMap;
-    }
-    const vector<Element*>& getAllElements() const {
-        return elementsInCircuit;
-    }
-    const vector<Diode*>& getOrderedDiodes() const {
-        return orderedDiodes;
-    }
+    const vector<Element*>& getAllElements() const { return elementsInCircuit; }
 };
 
 // MNASolver class
@@ -563,20 +518,15 @@ public:
     MNASolver() {}
 
     Eigen::VectorXd solve(const Eigen::MatrixXd& A, const Eigen::VectorXd& Z) {
-        if (A.rows() == 0 && Z.size() == 0) {
-            return Eigen::VectorXd(0);
-        }
+        if (A.rows() == 0 && Z.size() == 0) return Eigen::VectorXd(0);
         if (A.rows() != A.cols() || A.rows() != Z.size()) {
-            throw std::runtime_error("Error: Matrix and vector dimensions are not compatible for solving. A: " +
-                                     to_string(A.rows()) + "x" + to_string(A.cols()) + ", Z: " + to_string(Z.size()));
+            throw std::runtime_error("Matrix/vector dimensions incompatible for solving.");
         }
-        if (A.rows() == 0) {
-            throw std::runtime_error("Error: System of equations is empty (A has 0 rows).");
-        }
+        if (A.rows() == 0) throw std::runtime_error("System of equations is empty.");
 
         Eigen::PartialPivLU<Eigen::MatrixXd> lu(A);
         if (A.rows() > 0 && std::abs(lu.determinant()) < 1e-14) {
-            cout << "Warning: System matrix determinant is very close to zero (" << lu.determinant() << "). Matrix might be singular or ill-conditioned." << endl;
+            cout << "Warning: System matrix determinant is near zero. Matrix may be singular." << endl;
         }
         return lu.solve(Z);
     }
@@ -584,52 +534,36 @@ public:
     void updateCircuitState(const Eigen::VectorXd& X, MakingMNA& mnaCircuit) {
         const auto& nonGroundNodes = mnaCircuit.getOrderedNonGroundNodes();
         const auto& voltageSources = mnaCircuit.getOrderedVoltageSources();
-        const auto& inductors = mnaCircuit.getOrderedInductors(); // New
+        const auto& inductors = mnaCircuit.getOrderedInductors();
+        const auto& idealDiodes = mnaCircuit.getOrderedIdealDiodes();
 
         int numNonGroundNodes = nonGroundNodes.size();
         int numVoltageSources = voltageSources.size();
         int numInductors = inductors.size();
 
-        if (X.size() == 0 && numNonGroundNodes == 0 && numVoltageSources == 0 && numInductors == 0) {
-            return; // Nothing to update for an empty solved system
+        if (static_cast<size_t>(X.size()) != numNonGroundNodes + numVoltageSources + numInductors + idealDiodes.size()) {
+            throw std::runtime_error("Solution vector size does not match number of unknowns.");
         }
 
-        if (static_cast<size_t>(X.size()) != numNonGroundNodes + numVoltageSources + numInductors) {
-            throw std::runtime_error("Error: Solution vector size (" + to_string(X.size()) +
-                                     ") does not match the number of unknowns (" +
-                                     to_string(numNonGroundNodes + numVoltageSources + numInductors) + ").");
-        }
-
-        for (int i = 0; i < numNonGroundNodes; ++i) {
-            nonGroundNodes[i]->setVoltage(X(i));
-        }
-
-        for (size_t i = 0; i < voltageSources.size(); ++i) {
-            voltageSources[i]->setCurrent(X(numNonGroundNodes + i));
-        }
-
-        for (size_t i = 0; i < inductors.size(); ++i) {
-            inductors[i]->setCurrent(X(numNonGroundNodes + numVoltageSources + i));
-        }
+        for (size_t i = 0; i < nonGroundNodes.size(); ++i) nonGroundNodes[i]->setVoltage(X(i));
+        for (size_t i = 0; i < voltageSources.size(); ++i) voltageSources[i]->setCurrent(X(numNonGroundNodes + i));
+        for (size_t i = 0; i < inductors.size(); ++i) inductors[i]->setCurrent(X(numNonGroundNodes + numVoltageSources + i));
+        for (size_t i = 0; i < idealDiodes.size(); ++i) idealDiodes[i]->setCurrent(X(numNonGroundNodes + numVoltageSources + numInductors + i));
     }
 };
 
 // ===================================================================================
-// ===== NEW CODE FOR ADAPTIVE TIME-STEPPING STARTS HERE =============================
+// ===== NEW AND MODIFIED ANALYSIS CLASSES ===========================================
 // ===================================================================================
 
+
+// TransientAnalysis class
 class TransientAnalysis {
 private:
     MakingMNA& mnaCircuit;
     MNASolver solver;
 
-    // Parameters for adaptive time-stepping
-    double initial_h;
-    double min_h;
-    double max_h;
-    double tolerance;
-    double h_increase_factor;
-    double h_decrease_factor;
+    double initial_h, min_h, max_h, tolerance, h_increase_factor, h_decrease_factor;
 
 public:
     TransientAnalysis(MakingMNA& circuit, double initial_step, double min_step, double max_step, double tol)
@@ -644,83 +578,101 @@ public:
         double current_time = 0.0;
         double h = initial_h;
 
-        // --- Print Header ---
         cout << "Time (s)\t";
         const auto& nonGroundNodes = mnaCircuit.getOrderedNonGroundNodes();
-        for (const auto& node : nonGroundNodes) {
-            cout << "V(" << node->getName() << ")\t";
-        }
+        for (const auto& node : nonGroundNodes) cout << "V(" << node->getName() << ")\t";
+        for (const auto& vs : mnaCircuit.getOrderedVoltageSources()) cout << "I(" << vs->getName() << ")\t";
         cout << "(h)" << endl;
-        cout << "--------------------------------------------------------" << endl;
+        cout << "----------------------------------------------------------------" << endl;
 
 
         while (current_time < t_stop) {
-            // Adjust h if it would overshoot t_stop
-            if (current_time + h > t_stop) {
-                h = t_stop - current_time;
+            if (current_time + h > t_stop) h = t_stop - current_time;
+
+            for (auto& elem : mnaCircuit.getAllElements()) {
+                if (auto vs = dynamic_cast<VoltageSource*>(elem)) {
+                    if (vs->getName() == "Vsin") {
+                        vs->setVoltageValue(5.0 * sin(2 * M_PI * 60 * current_time));
+                    }
+                }
             }
 
-            // Store current voltages to estimate error after the trial step
-            std::vector<double> old_voltages;
-            for(const auto& node : nonGroundNodes) {
-                old_voltages.push_back(node->getVoltage());
+
+            bool diodes_converged = false;
+            int max_diode_iterations = 25;
+            int iteration_count = 0;
+
+            while (!diodes_converged && iteration_count < max_diode_iterations) {
+                iteration_count++;
+                diodes_converged = true;
+
+                Eigen::MatrixXd A = mnaCircuit.getSystemMatrixA();
+                Eigen::VectorXd Z = mnaCircuit.getSystemVectorZ();
+                Eigen::VectorXd X = solver.solve(A, Z);
+                solver.updateCircuitState(X, mnaCircuit);
+
+                for (auto& diode : mnaCircuit.getOrderedIdealDiodes()) {
+                    IdealDiode::State old_state = diode->getState();
+                    double v_anode = diode->getNode1()->getVoltage();
+                    double v_cathode = diode->getNode2()->getVoltage();
+
+                    if (old_state == IdealDiode::OFF) {
+                        if (v_anode > v_cathode + diode->getForwardVoltage()) {
+                            diode->setState(IdealDiode::ON);
+                            diodes_converged = false;
+                        }
+                    } else {
+                        if (diode->getCurrent() < 0) {
+                            diode->setState(IdealDiode::OFF);
+                            diodes_converged = false;
+                        }
+                    }
+                }
             }
+            if (iteration_count >= max_diode_iterations) {
+                cout << "Warning: Diode states failed to converge at t=" << current_time << endl;
+            }
+
+
+            std::vector<double> old_voltages;
+            for(const auto& node : nonGroundNodes) old_voltages.push_back(node->getVoltage());
 
             bool step_accepted = false;
             while (!step_accepted) {
-                // Prevent h from going below the minimum allowed step
-                if (h < min_h) {
-                    h = min_h;
-                }
-
+                if (h < min_h) h = min_h;
                 mnaCircuit.setTimeStep(h);
                 Eigen::MatrixXd A = mnaCircuit.getSystemMatrixA();
                 Eigen::VectorXd Z = mnaCircuit.getSystemVectorZ();
                 Eigen::VectorXd X = solver.solve(A, Z);
 
-                // Simple error estimation based on max voltage change
                 double max_voltage_change = 0.0;
                 for (size_t i = 0; i < nonGroundNodes.size(); ++i) {
                     double change = std::abs(X(i) - old_voltages[i]);
-                    if (change > max_voltage_change) {
-                        max_voltage_change = change;
-                    }
+                    if (change > max_voltage_change) max_voltage_change = change;
                 }
 
-                // Accept the step if error is within tolerance OR if we are already at the minimum step size
                 if (max_voltage_change <= tolerance || h == min_h) {
                     step_accepted = true;
                     solver.updateCircuitState(X, mnaCircuit);
                     current_time += h;
 
-                    // Update the "previous" values for all reactive components for the next step
-                    for (auto& node : mnaCircuit.getAllNodesInCircuit()) {
-                        node->updateVoltageForNextStep();
-                    }
-                    for (auto& ind : mnaCircuit.getOrderedInductors()) {
-                        ind->updateCurrentForNextStep();
-                    }
+                    for (auto& node : mnaCircuit.getAllNodesInCircuit()) node->updateVoltageForNextStep();
+                    for (auto& ind : mnaCircuit.getOrderedInductors()) ind->updateCurrentForNextStep();
 
-                    // --- Print results for this accepted step ---
-                    cout << current_time << "\t\t";
-                    for (const auto& node : nonGroundNodes) {
-                        cout << node->getVoltage() << "\t\t";
-                    }
+                    cout << current_time << "\t";
+                    for (const auto& node : nonGroundNodes) cout << node->getVoltage() << "\t";
+                    for (const auto& vs : mnaCircuit.getOrderedVoltageSources()) cout << vs->getCurrent() << "\t";
                     cout << "(h=" << h << ")" << endl;
 
-                    // Dynamically increase h for the next step if the change was very small
                     if (max_voltage_change < tolerance / 10.0 && h < max_h) {
                         h *= h_increase_factor;
                         if (h > max_h) h = max_h;
                     }
                 } else {
-                    // Reject the step, reduce h, and retry
                     h /= h_decrease_factor;
                 }
-
-                // Safety break to prevent infinite loops if h becomes pathologically small
                 if (h < 1e-18) {
-                    cerr << "Error: Timestep has become excessively small. Aborting analysis to prevent infinite loop." << endl;
+                    cerr << "Error: Timestep excessively small. Aborting." << endl;
                     return;
                 }
             }
@@ -728,42 +680,119 @@ public:
     }
 };
 
+// New Class for DC Sweep Analysis
+class DCSweepAnalysis {
+private:
+    MakingMNA& mnaCircuit;
+    MNASolver solver;
+    string sweepComponentName;
+    double startValue, endValue, increment;
 
-// Example main function to demonstrate the TransientAnalysis class
+public:
+    DCSweepAnalysis(MakingMNA& circuit, const string& compName, double start, double end, double inc)
+            : mnaCircuit(circuit), solver(), sweepComponentName(compName), startValue(start), endValue(end), increment(inc) {
+        if (increment <= 0) {
+            throw std::invalid_argument("DC sweep increment must be positive.");
+        }
+    }
+
+    void run() {
+        Element* sweepElement = mnaCircuit.getElement(sweepComponentName);
+        if (!sweepElement) {
+            throw std::runtime_error("Sweep component '" + sweepComponentName + "' not found.");
+        }
+
+        auto* sweepVoltageSource = dynamic_cast<VoltageSource*>(sweepElement);
+        auto* sweepResistor = dynamic_cast<Resistor*>(sweepElement);
+
+        if (!sweepVoltageSource && !sweepResistor) {
+            throw std::runtime_error("Sweep component must be a VoltageSource or a Resistor.");
+        }
+
+        cout << sweepComponentName << "\t";
+        for (const auto& node : mnaCircuit.getOrderedNonGroundNodes()) {
+            cout << "V(" << node->getName() << ")\t";
+        }
+        cout << endl;
+        cout << "-----------------------------------------------------" << endl;
+
+        for (double val = startValue; val <= endValue; val += increment) {
+            if (sweepVoltageSource) {
+                sweepVoltageSource->setVoltageValue(val);
+            } else if (sweepResistor) {
+                sweepResistor->setResistance(val);
+            }
+
+            // A DC analysis does not require diode state iteration
+            // unless the DC solution itself is non-linear, which we assume is not the case here
+            // for simplicity. A full implementation might need the diode loop here as well.
+
+            Eigen::MatrixXd A = mnaCircuit.getSystemMatrixA(true); // true for DC analysis
+            Eigen::VectorXd Z = mnaCircuit.getSystemVectorZ(true); // true for DC analysis
+            Eigen::VectorXd X = solver.solve(A, Z);
+            solver.updateCircuitState(X, mnaCircuit);
+
+            cout << val << "\t";
+            for (const auto& node : mnaCircuit.getOrderedNonGroundNodes()) {
+                cout << node->getVoltage() << "\t";
+            }
+            cout << endl;
+        }
+    }
+};
+
+
+// Main function
 int main() {
     try {
-        // --- Setup for the RC Circuit from the PDF ---
-        // V1 -- R1 -- (node 1) -- C1 -- GND
-        Node n_source_plus("source+");
-        Node n_1("1");
-        Node n_gnd_rc("0_rc");
+        cout << "===== DC Sweep Analysis of a Voltage Divider =====" << endl;
 
-        // Set initial conditions for the node (capacitor voltage is initially 0)
-        n_1.setVoltage(0.0);
-        n_1.setPreviousVoltage(0.0);
+        // --- Setup for a voltage divider: V1 -- R1 -- (out) -- R2 -- GND ---
+        Node n_in("in_dc");
+        Node n_out("out_dc");
+        Node n_gnd_dc("0_dc");
 
-        // Create elements
-        VoltageSource V1(&n_source_plus, &n_gnd_rc, "V1", 5.0);
-        Resistor R1_rc(&n_source_plus, &n_1, "R1", 1000.0);
-        Capacitor C1_rc(&n_1, &n_gnd_rc, "C1", 1e-6);
+        VoltageSource V1(&n_in, &n_gnd_dc, "V1", 1.0); // Initial value doesn't matter, will be swept
+        Resistor R1(&n_in, &n_out, "R1", 1000.0);
+        Resistor R2(&n_out, &n_gnd_dc, "R2", 1000.0);
 
-        // Build the circuit using the MNA helper class
-        MakingMNA mna_rc_circuit;
-        mna_rc_circuit.addNode(&n_source_plus);
-        mna_rc_circuit.addNode(&n_1);
-        mna_rc_circuit.addNode(&n_gnd_rc);
-        mna_rc_circuit.setGroundNode(&n_gnd_rc);
-        mna_rc_circuit.addElement(&V1);
-        mna_rc_circuit.addElement(&R1_rc);
-        mna_rc_circuit.addElement(&C1_rc);
+        MakingMNA mna_divider_circuit;
+        mna_divider_circuit.addNode(&n_in);
+        mna_divider_circuit.addNode(&n_out);
+        mna_divider_circuit.addNode(&n_gnd_dc);
+        mna_divider_circuit.setGroundNode(&n_gnd_dc);
+        mna_divider_circuit.addElement(&V1);
+        mna_divider_circuit.addElement(&R1);
+        mna_divider_circuit.addElement(&R2);
 
-        cout << "--- Running Adaptive Time Step Simulation for RC Circuit ---" << endl;
-        // Create the analysis driver with adaptive parameters:
-        // TransientAnalysis(circuit, initial_step, min_step, max_step, voltage_tolerance)
-        TransientAnalysis adaptive_sim(mna_rc_circuit, 1e-6, 1e-9, 1e-4, 0.01);
+        // Sweep V1 from 0V to 10V in 1V increments
+        DCSweepAnalysis dc_sweep(mna_divider_circuit, "V1", 0.0, 10.0, 1.0);
+        dc_sweep.run();
 
-        // Run the simulation until t=0.005s (5ms)
-        adaptive_sim.run(0.005);
+        cout << "\n\n===== Transient Analysis of Half-Wave Rectifier =====" << endl;
+        Node n_tr_in("in");
+        Node n_tr_out("out");
+        Node n_tr_gnd("0");
+
+        n_tr_out.setVoltage(0.0);
+        n_tr_out.setPreviousVoltage(0.0);
+
+        VoltageSource Vsin(&n_tr_in, &n_tr_gnd, "Vsin", 0.0);
+        IdealDiode D1(&n_tr_in, &n_tr_out, "D1", 0.7);
+        Resistor R_load(&n_tr_out, &n_tr_gnd, "R_load", 1000.0);
+
+        MakingMNA mna_rectifier_circuit;
+        mna_rectifier_circuit.addNode(&n_tr_in);
+        mna_rectifier_circuit.addNode(&n_tr_out);
+        mna_rectifier_circuit.addNode(&n_tr_gnd);
+        mna_rectifier_circuit.setGroundNode(&n_tr_gnd);
+        mna_rectifier_circuit.addElement(&Vsin);
+        mna_rectifier_circuit.addElement(&D1);
+        mna_rectifier_circuit.addElement(&R_load);
+
+        TransientAnalysis adaptive_sim(mna_rectifier_circuit, 1e-5, 1e-7, 1e-4, 0.05);
+        adaptive_sim.run(2.0 / 60.0);
+
 
     } catch (const std::exception& e) {
         cerr << "\n*** An exception occurred: " << e.what() << " ***" << endl;
